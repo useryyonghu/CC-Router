@@ -22,6 +22,7 @@ pub type Recorded = Arc<Mutex<Vec<RecordedRequest>>>;
 
 #[derive(Debug, Clone)]
 pub struct RecordedRequest {
+    pub method: String,
     pub path: String,
     pub query: Option<String>,
     pub headers: Vec<(String, String)>,
@@ -119,6 +120,7 @@ impl MockUpstream {
                                 let handler = handler.clone();
                                 let rec = rec.clone();
                                 async move {
+                                    let method = req.method().as_str().to_string();
                                     let path = req.uri().path().to_string();
                                     let query = req.uri().query().map(|q| q.to_string());
                                     let headers = req
@@ -131,7 +133,7 @@ impl MockUpstream {
                                     let body_bytes = req.into_body().collect().await.unwrap().to_bytes();
                                     let body = serde_json::from_slice(&body_bytes)
                                         .unwrap_or(serde_json::Value::Null);
-                                    rec.lock().unwrap().push(RecordedRequest { path, query, headers, body });
+                                    rec.lock().unwrap().push(RecordedRequest { method, path, query, headers, body });
                                     let resp = handler().await;
                                     Ok::<_, Infallible>(resp)
                                 }

@@ -25,6 +25,23 @@ fn messages_request(token: Option<&str>, body: &str) -> String {
     )
 }
 
+/// 无 body 的 GET（catch-all 路径用；不发送 Content-Length）。
+fn get_request(path: &str, token: Option<&str>) -> String {
+    let auth = match token {
+        Some(t) => format!("Authorization: Bearer {t}\r\n"),
+        None => String::new(),
+    };
+    format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Connection: close\r\n\r\n")
+}
+
+/// 只用 `x-api-key` 携带本地令牌的 POST（不带 Authorization）。
+fn messages_request_with_api_key(key: &str, body: &str) -> String {
+    format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nx-api-key: {key}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
 #[tokio::test]
 async fn health_endpoint_requires_no_token() {
     let upstream = MockUpstream::start_json(200, ok_message_body("k3")).await;
@@ -220,6 +237,72 @@ async fn oversized_body_returns_413() {
     assert!(resp.starts_with("HTTP/1.1 413"), "{resp}");
     assert!(resp.contains("\"type\":\"invalid_request_error\""));
     assert!(upstream.requests().is_empty());
+
+    gw.shutdown().await;
+    upstream.shutdown().await;
+}
+
+/// spec §6.1 的免鉴权面是 **GET** `/ccr/health`；其它方法必须走令牌闸门。
+#[tokio::test]
+async fn post_to_health_requires_token() {
+    let upstream = MockUpstream::start_json(200, ok_message_body("k3")).await;
+    let (gw, _log) = start_gateway(test_config(&upstream.base_url, 0)).await;
+
+    let resp = raw_request(
+        gw.bound_port,
+        "POST /ccr/health HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 401"), "{resp}");
+    assert!(resp.contains("\"type\":\"authentication_error\""), "{resp}");
+    assert!(upstream.requests().is_empty(), "upstream must not be contacted");
+
+    gw.shutdown().await;
+    upstream.shutdown().await;
+}
+
+/// catch-all 路径必须保留客户端的原始方法，且无 body 的请求不得被塞进一个空 body。
+#[tokio::test]
+async fn catch_all_preserves_method_and_forwards_bodyless_get() {
+    let upstream = MockUpstream::start_json(200, ok_message_body("ds-pro")).await;
+    let (gw, _log) = start_gateway(test_config(&upstream.base_url, 0)).await;
+
+    let resp = raw_request(gw.bound_port, &get_request("/v1/organizations", Some(TOKEN))).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+
+    let seen = upstream.requests();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].method, "GET", "catch-all must not flatten the method to POST");
+    assert_eq!(seen[0].path, "/v1/organizations");
+    assert!(
+        seen[0].body.is_null(),
+        "bodyless GET must not gain a body: {:?}",
+        seen[0].body
+    );
+
+    gw.shutdown().await;
+    upstream.shutdown().await;
+}
+
+/// 本地令牌也可以只通过 `x-api-key` 携带；且它绝不能泄漏到上游（会被换成 provider 密钥）。
+#[tokio::test]
+async fn token_accepts_x_api_key_header() {
+    let upstream = MockUpstream::start_json(200, ok_message_body("k3")).await;
+    let (gw, _log) = start_gateway(test_config(&upstream.base_url, 0)).await;
+
+    let body = r#"{"model":"ccr-kimi-k3","max_tokens":5,"messages":[]}"#;
+    let resp = raw_request(gw.bound_port, &messages_request_with_api_key(TOKEN, body)).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+
+    let seen = upstream.requests();
+    assert_eq!(seen.len(), 1, "x-api-key must authenticate the request");
+    assert_eq!(seen[0].body["model"], "k3");
+    assert_eq!(
+        seen[0].header("x-api-key"),
+        Some("kimi-real-key"),
+        "local token must be replaced by the provider key, never forwarded"
+    );
+    assert_eq!(seen[0].header("authorization"), Some("Bearer kimi-real-key"));
 
     gw.shutdown().await;
     upstream.shutdown().await;

@@ -135,7 +135,8 @@ pub async fn handle(req: Request<Incoming>, state: GatewayState, _peer: SocketAd
     let query = req.uri().query().map(|q| q.to_string());
     let method = req.method().as_str().to_string();
 
-    if path == "/ccr/health" {
+    // 免鉴权面**仅限** `GET /ccr/health`（spec §6.1）；其它方法落到下面的令牌闸门。
+    if path == "/ccr/health" && req.method() == hyper::Method::GET {
         return health(&state);
     }
 
@@ -224,7 +225,13 @@ pub async fn handle(req: Request<Incoming>, state: GatewayState, _peer: SocketAd
     let headers = build_headers(&resolved, &incoming_headers).headers;
 
     let started = Instant::now();
-    let mut builder = state.client.post(&url).body(upstream_body);
+    // 保留客户端原始方法：catch-all 路径（如 `GET /v1/organizations`）不能被压平成 POST。
+    let upstream_method = reqwest::Method::from_bytes(method.as_bytes())
+        .unwrap_or(reqwest::Method::POST);
+    let mut builder = state.client.request(upstream_method, &url);
+    if !upstream_body.is_empty() {
+        builder = builder.body(upstream_body);
+    }
     for (name, value) in headers.iter() {
         builder = builder.header(name.as_str(), value.as_bytes());
     }
