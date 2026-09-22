@@ -54,9 +54,26 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<ConfigError>> {
     if cfg.gateway.max_request_body_bytes == 0 {
         errs.push(ConfigError::new("gateway.maxRequestBodyBytes", "请求体上限必须大于 0"));
     }
+    // 0 不是"禁用超时"：`tokio::time::timeout(0, ..)` 会在首个字节到达前就到期，
+    // 也就是说 0 会让每一次流式请求当场失败。要表达"实际上不超时"请填一个大值。
+    if cfg.gateway.connect_timeout_ms == 0 {
+        errs.push(ConfigError::new(
+            "gateway.connectTimeoutMs",
+            "不能为 0：0 不表示\"禁用超时\"，而是让连接立刻超时；要表达\"实际上不超时\"请填一个大值（例如 300000）",
+        ));
+    }
+    if cfg.gateway.idle_timeout_ms == 0 {
+        errs.push(ConfigError::new(
+            "gateway.idleTimeoutMs",
+            "不能为 0：0 不表示\"禁用超时\"，而是让每个请求在首块到达前就超时；要表达\"实际上不超时\"请填一个大值（例如 300000）",
+        ));
+    }
 
     let mut provider_ids: HashSet<&str> = HashSet::new();
-    let mut aliases: HashSet<&str> = HashSet::new();
+    // 路由表以 `alias.trim().to_lowercase()` 为键（`RouteTable::build`），
+    // 校验必须用同一规范化键，否则只差大小写/首尾空白的两个别名会双双通过校验，
+    // 然后在路由时互相遮蔽（静默丢一条规则）。
+    let mut aliases: HashSet<String> = HashSet::new();
 
     for (pi, p) in cfg.providers.iter().enumerate() {
         let pf = |f: &str| format!("providers[{pi}].{f}");
@@ -97,8 +114,8 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<ConfigError>> {
             if m.alias.trim().is_empty() {
                 errs.push(ConfigError::new(mf("alias"), "别名不能为空"));
             }
-            if !aliases.insert(m.alias.as_str()) {
-                errs.push(ConfigError::new(mf("alias"), "别名全局重复"));
+            if !aliases.insert(m.alias.trim().to_lowercase()) {
+                errs.push(ConfigError::new(mf("alias"), "别名全局重复（比较时忽略大小写与首尾空白）"));
             }
         }
     }
@@ -107,8 +124,8 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<ConfigError>> {
         let ef = |f: &str| format!("extraRoutes[{}].{f}", r.alias);
         if r.alias.trim().is_empty() {
             errs.push(ConfigError::new("extraRoutes[].alias", "别名不能为空"));
-        } else if !aliases.insert(r.alias.as_str()) {
-            errs.push(ConfigError::new(ef("alias"), "别名与已有别名冲突"));
+        } else if !aliases.insert(r.alias.trim().to_lowercase()) {
+            errs.push(ConfigError::new(ef("alias"), "别名与已有别名冲突（比较时忽略大小写与首尾空白）"));
         }
         check_target(cfg, &ef(""), &Target { provider_id: r.provider_id.clone(), model_id: r.model_id.clone() }, &mut errs);
     }
@@ -282,6 +299,69 @@ mod tests {
         cfg.providers[1].models[0].alias = "ccr-kimi-k3".to_string();
         let errs = validate(&cfg).unwrap_err();
         assert!(errs.iter().any(|e| e.field.ends_with(".alias")));
+    }
+
+    /// 路由按 `trim().to_lowercase()` 查表，校验集合必须同键：只差大小写或首尾空白的
+    /// 两个别名必须被拒，否则会静默遮蔽。
+    #[test]
+    fn rejects_aliases_that_collide_after_case_and_whitespace_normalization() {
+        for dup in ["CCR-Kimi-K3", "  ccr-kimi-k3  ", "Ccr-Kimi-K3 "] {
+            let mut cfg = base_cfg();
+            cfg.providers[1].models[0].alias = dup.to_string();
+            let errs = validate(&cfg).unwrap_err();
+            assert!(
+                errs.iter().any(|e| e.field.ends_with(".alias")),
+                "alias {dup:?} normalizes onto ccr-kimi-k3 and must be rejected: {errs:?}"
+            );
+        }
+
+        // extraRoutes 与模型别名之间同样按规范化键去重
+        let mut cfg = base_cfg();
+        cfg.extra_routes.push(ExtraRoute {
+            alias: "CCR-Kimi-K3".to_string(),
+            provider_id: "kimi".to_string(),
+            model_id: "k3".to_string(),
+        });
+        let errs = validate(&cfg).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.field.contains("extraRoutes")),
+            "extraRoute alias must not case-shadow a model alias: {errs:?}"
+        );
+    }
+
+    /// I4：0 会被 `tokio::time::timeout` 当成"立即超时"，绝不能当成"禁用"。
+    #[test]
+    fn rejects_zero_connect_and_idle_timeouts() {
+        let mut cfg = base_cfg();
+        cfg.gateway.connect_timeout_ms = 0;
+        let errs = validate(&cfg).unwrap_err();
+        let e = errs
+            .iter()
+            .find(|e| e.field == "gateway.connectTimeoutMs")
+            .unwrap_or_else(|| panic!("connectTimeoutMs=0 must be rejected: {errs:?}"));
+        assert!(e.message.contains('0'), "message must name the offending value: {}", e.message);
+        assert!(e.message.contains("禁用"), "message must say 0 does not mean disabled: {}", e.message);
+        assert!(e.message.contains("300000"), "message must say how to express 'no timeout': {}", e.message);
+
+        let mut cfg = base_cfg();
+        cfg.gateway.idle_timeout_ms = 0;
+        let errs = validate(&cfg).unwrap_err();
+        let e = errs
+            .iter()
+            .find(|e| e.field == "gateway.idleTimeoutMs")
+            .unwrap_or_else(|| panic!("idleTimeoutMs=0 must be rejected: {errs:?}"));
+        assert!(e.message.contains('0'), "message must name the offending value: {}", e.message);
+        assert!(e.message.contains("禁用"), "message must say 0 does not mean disabled: {}", e.message);
+        assert!(e.message.contains("300000"), "message must say how to express 'no timeout': {}", e.message);
+
+        // 同一错误不能污染另一字段
+        let mut cfg = base_cfg();
+        cfg.gateway.connect_timeout_ms = 0;
+        let errs = validate(&cfg).unwrap_err();
+        assert!(
+            !errs.iter().any(|e| e.field == "gateway.idleTimeoutMs"),
+            "only the offending field may be reported: {errs:?}"
+        );
     }
 
     #[test]

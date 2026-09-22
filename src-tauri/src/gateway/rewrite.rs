@@ -119,6 +119,13 @@ pub fn build_headers(target: &ResolvedTarget, incoming: &HeaderMap) -> UpstreamH
     if let Ok(v) = HeaderValue::from_str(&target.provider_id) {
         out.insert(HeaderName::from_static("x-ccr-provider"), v);
     }
+    // spec §6.3：角色也随请求带上（上游会忽略未知头，这只是给上游日志排查用）。
+    // 无角色时与 `x-ccr-alias` 一样省略；多角色共享同一别名时按 §6.7 逗号连接。
+    if let Some(label) = target.role_label() {
+        if let Ok(v) = HeaderValue::from_str(&label) {
+            out.insert(HeaderName::from_static("x-ccr-role"), v);
+        }
+    }
 
     // host / content-length / accept-encoding / connection 不在此白名单内，天然被丢弃
     UpstreamHeaders { headers: out }
@@ -128,7 +135,7 @@ pub fn build_headers(target: &ResolvedTarget, incoming: &HeaderMap) -> UpstreamH
 mod tests {
     use super::*;
     use crate::config::AuthStyle;
-    use crate::routing::resolve::{MatchedBy, ResolvedTarget};
+    use crate::routing::resolve::{MatchedBy, ResolvedTarget, Role};
 
     fn target(auth_style: AuthStyle, context_1m: bool) -> ResolvedTarget {
         ResolvedTarget {
@@ -140,7 +147,7 @@ mod tests {
             upstream_model: "k3".into(),
             alias: "ccr-kimi-k3".into(),
             matched_by: MatchedBy::Alias,
-            role: None,
+            roles: Vec::new(),
             context_1m,
         }
     }
@@ -251,5 +258,28 @@ mod tests {
     fn does_not_add_context_1m_beta_when_disabled() {
         let h = build_headers(&target(AuthStyle::Both, false), &incoming()).headers;
         assert!(!h.get("anthropic-beta").unwrap().to_str().unwrap().contains(CONTEXT_1M_BETA));
+    }
+
+    /// M6 / spec §6.3：`x-ccr-role` 只在解析出角色时发送，且与 §6.7 的日志字段同源
+    /// （共享别名时给出逗号连接的多值）。
+    #[test]
+    fn emits_x_ccr_role_only_when_a_role_is_resolved() {
+        let no_role = target(AuthStyle::Both, false);
+        assert!(
+            build_headers(&no_role, &incoming()).headers.get("x-ccr-role").is_none(),
+            "no role → header omitted, like x-ccr-alias when the alias is empty"
+        );
+
+        let mut single = target(AuthStyle::Both, false);
+        single.roles = vec![Role::Main];
+        assert_eq!(build_headers(&single, &incoming()).headers.get("x-ccr-role").unwrap(), "main");
+
+        let mut shared = target(AuthStyle::Both, false);
+        shared.roles = vec![Role::Fast, Role::Subagent];
+        assert_eq!(
+            build_headers(&shared, &incoming()).headers.get("x-ccr-role").unwrap(),
+            "fast,subagent",
+            "an alias referenced by several roles reports the full sorted set"
+        );
     }
 }

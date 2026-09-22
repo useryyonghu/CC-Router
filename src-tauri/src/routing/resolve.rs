@@ -7,6 +7,24 @@ pub enum MatchedBy {
     Alias,
     Family,
     Fallback,
+    /// spec §6.1：非 messages 路径的 catch-all 转发，与"未知模型走 policy default"的
+    /// `Fallback` 是两回事，日志必须能区分是哪条规则生效。
+    Passthrough,
+    /// spec §6.7：路由阶段就失败（当前为未知模型 + policy=error），没有 `ResolvedTarget`。
+    Error,
+}
+
+impl MatchedBy {
+    /// 日志 `matchedBy` 字段的唯一取值来源（spec §6.7）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MatchedBy::Alias => "alias",
+            MatchedBy::Family => "family",
+            MatchedBy::Fallback => "fallback",
+            MatchedBy::Passthrough => "passthrough",
+            MatchedBy::Error => "error",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -14,6 +32,16 @@ pub enum Role {
     Main,
     Fast,
     Subagent,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Main => "main",
+            Role::Fast => "fast",
+            Role::Subagent => "subagent",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,18 +54,29 @@ pub struct ResolvedTarget {
     pub upstream_model: String,
     pub alias: String,
     pub matched_by: MatchedBy,
-    pub role: Option<Role>,
+    /// 别名 → 引用该别名的角色集合（反向查，已排序）。spec §6.7 要求多值时逗号连接；
+    /// 别名被清空（fallback/passthrough）时本集合也必须为空，否则日志会说"角色 fast"
+    /// 却又没有别名可依。
+    pub roles: Vec<Role>,
     pub context_1m: bool,
+}
+
+impl ResolvedTarget {
+    /// spec §6.7：`role` 字段是别名 → 角色集合的反向查，多值逗号连接（如 `main,subagent`）；
+    /// 无角色时为 `None`。`x-ccr-role`（spec §6.3）与本字段同源。
+    pub fn role_label(&self) -> Option<String> {
+        if self.roles.is_empty() {
+            None
+        } else {
+            Some(self.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>().join(","))
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ResolveError {
     #[error("模型 '{requested}' 未被 CC Router 路由：请在角色路由中为它添加规则，或设置默认目标")]
     UnknownModel { requested: String },
-    #[error("模型 '{requested}' 命中了角色 '{role}'，但该角色未绑定模型")]
-    UnboundRole { requested: String, role: &'static str },
-    #[error("配置指向不存在的目标 {provider_id}/{model_id}")]
-    DanglingTarget { provider_id: String, model_id: String },
 }
 
 #[derive(Debug, Clone)]
@@ -58,20 +97,6 @@ pub struct RouteTable {
     role_aliases: HashMap<Role, String>,
     default_entry: Option<Entry>,
     policy: UnknownModelPolicy,
-}
-
-// `UnknownModelPolicy` 未实现 `Default`，且 config 不在本任务的改动范围内，
-// 所以 `Default` 只能手写。空表的 policy 取不到任何可观察差异：
-// aliases/role_aliases 皆空且 default_entry 为 None 时，两种策略都只会返回 UnknownModel。
-impl Default for RouteTable {
-    fn default() -> Self {
-        RouteTable {
-            aliases: HashMap::new(),
-            role_aliases: HashMap::new(),
-            default_entry: None,
-            policy: UnknownModelPolicy::Default,
-        }
-    }
 }
 
 impl RouteTable {
@@ -185,9 +210,9 @@ impl RouteTable {
         if let Some(role) = family_role {
             if let Some(alias) = self.role_aliases.get(&role) {
                 if let Some(entry) = self.aliases.get(alias) {
-                    let mut resolved = self.finish(entry.clone(), forced_1m, MatchedBy::Family);
-                    resolved.role = Some(role);
-                    return Ok(resolved);
+                    // 别名命中的角色集合已在 `finish` 里反查好；家族角色必然在其中
+                    // （`role_aliases[role]` 就是这个条目的别名键），无需再覆写。
+                    return Ok(self.finish(entry.clone(), forced_1m, MatchedBy::Family));
                 }
             }
         }
@@ -196,7 +221,10 @@ impl RouteTable {
             UnknownModelPolicy::Default => match &self.default_entry {
                 Some(entry) => {
                     let mut resolved = self.finish(entry.clone(), forced_1m, MatchedBy::Fallback);
+                    // 别名被清空 → 角色反向查失去依据，日志里 role 必须同为 null，
+                    // 否则会出现"alias 为空、role=fast"这种自相矛盾的一行。
                     resolved.alias = String::new();
+                    resolved.roles.clear();
                     Ok(resolved)
                 }
                 None => Err(ResolveError::UnknownModel { requested: without_marker }),
@@ -208,22 +236,22 @@ impl RouteTable {
     }
 
     /// 直接解析一个显式 Target。用于 catch-all 路径转发到 defaultTarget，
-    /// 以及"未绑定角色但需要取该目标别名"的场景。返回值的 `alias` 为空、`role` 为 None
-    /// （因为它不是通过别名命中的）。
+    /// 以及"未绑定角色但需要取该目标别名"的场景。返回值的 `alias` 为空、`roles` 为空
+    /// （因为它不是通过别名命中的），`matched_by` 为 `Passthrough`（spec §6.1）。
     pub fn resolve_target(&self, t: &crate::config::Target) -> Option<ResolvedTarget> {
         let entry = self
             .aliases
             .values()
             .find(|e| e.provider_id == t.provider_id && e.upstream_model == t.model_id)
             .cloned()?;
-        let mut r = self.finish(entry, false, MatchedBy::Fallback);
+        let mut r = self.finish(entry, false, MatchedBy::Passthrough);
         r.alias = String::new();
-        r.role = None;
+        r.roles.clear();
         Some(r)
     }
 
     fn finish(&self, entry: Entry, forced_1m: bool, matched_by: MatchedBy) -> ResolvedTarget {
-        let role = self.roles_for_alias(&entry.alias).first().copied();
+        let roles = self.roles_for_alias(&entry.alias);
         ResolvedTarget {
             provider_id: entry.provider_id,
             provider_name: entry.provider_name,
@@ -234,7 +262,7 @@ impl RouteTable {
             context_1m: forced_1m || entry.context_1m,
             alias: entry.alias,
             matched_by,
-            role,
+            roles,
         }
     }
 }
@@ -349,7 +377,7 @@ mod tests {
             let r = t.resolve(m).unwrap();
             assert_eq!(r.provider_id, "kimi", "{m} should map to main");
             assert_eq!(r.matched_by, MatchedBy::Family);
-            assert_eq!(r.role, Some(Role::Main));
+            assert_eq!(r.roles, vec![Role::Main]);
             assert_eq!(r.upstream_model, "k3");
         }
     }
@@ -362,6 +390,28 @@ mod tests {
         let r = t.resolve("claude-opus-4-5-20251101").unwrap();
         assert_eq!(r.matched_by, MatchedBy::Fallback);
         assert_eq!(r.alias, "", "fallback responses carry no alias");
+        assert!(r.roles.is_empty(), "no alias → nothing to reverse-look-up (spec §6.7)");
+        assert_eq!(r.role_label(), None);
+    }
+
+    /// spec §6.2 规则 1 必须先于规则 2：别名精确匹配优先于 Claude 家族兜底，
+    /// 即使别名本身含家族词（`haiku`）也必须走别名。
+    #[test]
+    fn alias_match_wins_over_family_fallback_even_when_the_alias_contains_a_family_word() {
+        let mut cfg = cfg_with(UnknownModelPolicy::Error, vec![]);
+        cfg.providers[0].models.push(model("haiku-x", "ccr-haiku-x", false));
+        let t = RouteTable::build(&cfg);
+
+        let r = t.resolve("ccr-haiku-x").unwrap();
+        assert_eq!(
+            r.matched_by,
+            MatchedBy::Alias,
+            "alias match (rule 1) must precede the family fallback (rule 2)"
+        );
+        assert_eq!(r.provider_id, "kimi", "family fallback would have gone to roles.fast = deepseek");
+        assert_eq!(r.upstream_model, "haiku-x");
+        assert_eq!(r.alias, "ccr-haiku-x");
+        assert!(r.roles.is_empty(), "no role references this alias");
     }
 
     #[test]
@@ -420,7 +470,12 @@ mod tests {
         assert_eq!(r.upstream_model, "ds-pro");
         assert_eq!(r.api_key, "deepseek-key");
         assert_eq!(r.alias, "", "explicit-target resolution carries no alias");
-        assert_eq!(r.role, None);
+        assert!(r.roles.is_empty());
+        assert_eq!(
+            r.matched_by,
+            MatchedBy::Passthrough,
+            "spec §6.1: catch-all forwarding must be labelled passthrough, not fallback"
+        );
 
         let missing = crate::config::Target { provider_id: "nope".into(), model_id: "x".into() };
         assert!(t.resolve_target(&missing).is_none());

@@ -63,7 +63,8 @@ async fn streams_chunks_without_buffering() {
     assert!(total.contains("text/event-stream"), "content-type must be preserved: {total}");
     let first = first_chunk_at.expect("must observe message_start");
     assert!(
-        first < finished_at - Duration::from_millis(800),
+        // saturating_sub：finished_at 若小于 800ms，普通减法会 panic 而不是给出判定。
+        first < finished_at.saturating_sub(Duration::from_millis(800)),
         "first chunk at {first:?} vs finished at {finished_at:?}: looks buffered"
     );
     // 对齐 spec AC4：首块到达应约等于上游首块延迟（300ms）+ 很小的转发开销。

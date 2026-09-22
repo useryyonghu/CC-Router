@@ -76,6 +76,9 @@ pub async fn start_on(
         .map_err(|e| Error::Bind { addr: format!("{bind}:{port}"), source: e })?
         .port();
 
+    // 注意：客户端只在网关启动时构造一次，所以改 `gateway.connectTimeoutMs` 不会热生效，
+    // 必须等下一次启动网关（spec §5.5 把 `gateway.port` 列为唯一需要重启的设置，这里刻意
+    // 不为此引入"配置变更即重建客户端"的额外状态）。
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_millis(connect_timeout_ms))
         .pool_idle_timeout(std::time::Duration::from_secs(90))
@@ -135,6 +138,8 @@ pub async fn handle(req: Request<Incoming>, state: GatewayState, _peer: SocketAd
     let path = req.uri().path().to_string();
     let query = req.uri().query().map(|q| q.to_string());
     let method = req.method().as_str().to_string();
+    // 请求一开始就计时：路由阶段的失败（I3）也要有 latencyMs，不能只有成功路径才有。
+    let started = Instant::now();
 
     // 免鉴权面**仅限** `GET /ccr/health`（spec §6.1）；其它方法落到下面的令牌闸门。
     if path == "/ccr/health" && req.method() == hyper::Method::GET {
@@ -192,7 +197,19 @@ pub async fn handle(req: Request<Incoming>, state: GatewayState, _peer: SocketAd
     let resolved = if is_messages || is_count {
         match route_table.resolve(&requested_model) {
             Ok(r) => r,
-            Err(e) => return resolve_error_response(&e),
+            Err(e) => {
+                // spec §6.7：路由失败也必须留痕（`matchedBy="error"`）。否则一个打错的
+                // 别名只留下 400，日志里与"请求根本没到网关"完全无法区分。
+                state.log.push(crate::logging::LogEntry::routing_error(
+                    &method,
+                    &path,
+                    &requested_model,
+                    StatusCode::BAD_REQUEST.as_u16(),
+                    started.elapsed().as_millis() as u64,
+                    &e.to_string(),
+                ));
+                return resolve_error_response(&e);
+            }
         }
     } else {
         // 非 messages 路径：转发到 defaultTarget；未绑定则 404（spec §6.1）
@@ -234,7 +251,6 @@ pub async fn handle(req: Request<Incoming>, state: GatewayState, _peer: SocketAd
     let url = upstream_url(&resolved.base_url, &path, query.as_deref());
     let headers = build_headers(&resolved, &incoming_headers).headers;
 
-    let started = Instant::now();
     // 保留客户端原始方法：catch-all 路径（如 `GET /v1/organizations`）不能被压平成 POST。
     let upstream_method = reqwest::Method::from_bytes(method.as_bytes())
         .unwrap_or(reqwest::Method::POST);
@@ -288,28 +304,67 @@ pub async fn handle(req: Request<Incoming>, state: GatewayState, _peer: SocketAd
     }
 
     state.requests_served.fetch_add(1, Ordering::Relaxed);
-    state.log.push(crate::logging::LogEntry::ok(
-        &method,
-        &path,
-        &requested_model,
-        &resolved,
-        status.as_u16(),
-        is_sse,
-        started.elapsed().as_millis() as u64,
-    ));
 
     let body: BoxedBody = if is_sse {
+        // 流式：日志在"流开始"时写（这是流式的固有语义，body 还没结束）。
+        state.log.push(crate::logging::LogEntry::ok(
+            &method,
+            &path,
+            &requested_model,
+            &resolved,
+            status.as_u16(),
+            true,
+            started.elapsed().as_millis() as u64,
+        ));
         let idle = std::time::Duration::from_millis(idle_timeout_ms);
         body_stream(idle_guarded(upstream.bytes_stream(), idle))
     } else {
-        match upstream.bytes().await {
-            Ok(b) => body_full(b),
-            Err(e) => {
-                return anthropic_error(
-                    StatusCode::BAD_GATEWAY,
-                    ErrorKind::Api,
-                    format!("读取上游响应失败（provider={}）: {e}", resolved.provider_id),
-                )
+        // 非流式：正文读取必须受同一个空闲超时约束（spec §6.5 的 504）。超时只加在这里，
+        // 不加在 `reqwest::Client` 上——总超时会误杀"长时间但一直有数据"的流式响应。
+        let idle = std::time::Duration::from_millis(idle_timeout_ms);
+        match tokio::time::timeout(idle, upstream.bytes()).await {
+            Ok(Ok(b)) => {
+                // 成功日志必须在正文**读完之后**才写：读失败/超时不允许被记成 ok。
+                state.log.push(crate::logging::LogEntry::ok(
+                    &method,
+                    &path,
+                    &requested_model,
+                    &resolved,
+                    status.as_u16(),
+                    false,
+                    started.elapsed().as_millis() as u64,
+                ));
+                body_full(b)
+            }
+            Ok(Err(e)) => {
+                let message = format!(
+                    "读取上游响应失败（provider={} 别名={}）: {e}",
+                    resolved.provider_id, resolved.alias
+                );
+                state.log.push(crate::logging::LogEntry::error(
+                    &method,
+                    &path,
+                    &requested_model,
+                    &resolved,
+                    started.elapsed().as_millis() as u64,
+                    &message,
+                ));
+                return anthropic_error(StatusCode::BAD_GATEWAY, ErrorKind::Api, message);
+            }
+            Err(_elapsed) => {
+                let message = format!(
+                    "上游响应超时（provider={} 别名={} url={}）：空闲 {} ms 内未收到完整响应体",
+                    resolved.provider_id, resolved.alias, url, idle_timeout_ms
+                );
+                state.log.push(crate::logging::LogEntry::error(
+                    &method,
+                    &path,
+                    &requested_model,
+                    &resolved,
+                    started.elapsed().as_millis() as u64,
+                    &message,
+                ));
+                return anthropic_error(StatusCode::GATEWAY_TIMEOUT, ErrorKind::Api, message);
             }
         }
     };
@@ -360,17 +415,21 @@ pub fn models_payload(cfg: &Config) -> serde_json::Value {
             "display_name": format!("{} / {} (extra route)", r.provider_id, r.model_id),
         }));
     }
+    // 只有 extraRoutes（providers 下没有任何模型）时 first/last 必须回落到 extra 别名，
+    // 否则列表非空而 first_id/last_id 为 null。
     let first_id = cfg
         .providers
         .iter()
         .find_map(|p| p.models.first())
-        .map(|m| m.alias.clone());
+        .map(|m| m.alias.clone())
+        .or_else(|| cfg.extra_routes.first().map(|r| r.alias.clone()));
     let last_id = cfg
         .providers
         .iter()
         .rev()
         .find_map(|p| p.models.last())
-        .map(|m| m.alias.clone());
+        .map(|m| m.alias.clone())
+        .or_else(|| cfg.extra_routes.last().map(|r| r.alias.clone()));
     json!({
         "data": data,
         "has_more": false,
