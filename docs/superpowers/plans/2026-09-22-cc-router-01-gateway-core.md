@@ -1,5 +1,42 @@
 # CC Router 网关内核 Implementation Plan
 
+> **执行后记（2026-09-22 实施完成，务必先读）**
+>
+> 本计划已按 subagent-driven-development 执行完毕：8 个任务、每个都经独立评审，**3 个任务各有一轮修复**，
+> 全部完成后做了一次整分支终审（0 Critical / 4 Important / 10 Minor），并做了**一次**终审修复波。
+> 最终状态：分支 `feat/gateway-core`，`cargo test` → **93 passed, 0 failed**
+> （58 lib + 16 `gateway_nonstream` + 10 `gateway_stream` + 9 `request_log`）。
+>
+> **本文件中的代码块不是最终权威** —— 执行过程中发现计划自身的代码存在多处缺陷（不能编译、断言不可能成立、
+> 或与 spec 冲突），均已就地修正，并以提交为准。若要重跑本计划，务必先把下面这些**计划级缺陷**补齐，
+> 否则会重新引入已被终审判定必须修复的问题：
+>
+> | 缺陷 | 落点 | 修正提交 |
+> |---|---|---|
+> | 计划/规格缺口：spec §6.1/§6.7 要求 catch-all 记为 `matchedBy="passthrough"`（与 `fallback` 区分），计划里的 `MatchedBy` 没有该值 | `routing/resolve.rs` | `a23680b` |
+> | 计划/规格缺口：spec §6.5 的 504 行只实现了一半 —— 非流式上游读体**完全没有超时**，provider 卡住即永久挂起 | `gateway/server.rs` | `a23680b` |
+> | 计划/规格缺口：spec §6.7 的 `matchedBy="error"` 未实现，路由失败**不写日志**，别名打错在日志里完全看不见 | `gateway/server.rs`、`logging/mod.rs` | `a23680b` |
+> | `idle_timeout_ms = 0` 会静默截断每条流（`timeout(0, …)`），且 0 容易被误读为"禁用"；计划未加校验 | `config/validate.rs` | `a23680b` |
+> | `use super::{validate, Config}` 导入的是**模块**而非函数，`E0423` 编译失败 | `config/store.rs` | `a65bea0` |
+> | `Role` 缺 `Hash`，`HashMap<Role, String>` 无法编译；`RouteTable` 的 `#[derive(Default)]` 因 `UnknownModelPolicy` 无 `Default` 而失败 | `routing/resolve.rs` | `43ca541` |
+> | `body_stream` 少了 `+ Sync`（`BoxBody` 内部是 `dyn Body + Send + Sync`）；`StreamBody::new(..).boxed()` 因两个 trait 都实现而二义（`E0034`）；`Gateway` 缺 `Debug` | `gateway/body.rs`、`gateway/server.rs` | `839b2d1` |
+> | 串扰断言数的是裸子串 `"message_start"`，而同一块里它出现两次，`count()==1` **不可能成立** | `tests/gateway_stream.rs` | `6646f81` |
+> | 计划承诺的 `MockResponse` 类型在任何代码里都不存在（陈旧接口描述） | `tests/support/mod.rs` | `839b2d1` |
+> | Task 7 缺 `use futures_util::StreamExt;`（`idle_guarded` 调 `s.next()` 需要） | `gateway/server.rs` | `a65bea0` |
+> | 计划规格缺口：空闲超时分支与"客户端断开取消上游"**没有任何已提交测试**（当时只有临时用例） | `tests/gateway_stream.rs` | `314b267` |
+> | 计划规格缺口：`api_key` 完全未被校验，非法 key 会在 `build_headers` 里静默降级成**空凭据**，表现为无法定位的 401 | `config/validate.rs` | `2bfc84b` |
+> | `/ccr/health` 只判路径不判方法，导致 `POST /ccr/health` 也免鉴权（spec 定义的是 `GET`） | `gateway/server.rs` | `06a780e` |
+> | catch-all 写死 `client.post(&url)`，把所有转发请求压成无 body 的 POST | `gateway/server.rs` | `06a780e` |
+> | 计划规格缺口：`ConfigStore::save` 未串行化 + 临时文件名只用 PID，并发保存会让磁盘与内存不一致 | `config/store.rs` | `54f3535` |
+>
+> 另有若干 Minor 在终审修复波中一并处理（别名校验大小写归一化、`x-ccr-role` 头、日志多角色逗号连接、
+> 删除死代码、`first_id/last_id` 覆盖 extraRoutes 等），见 `a23680b`。
+>
+> **尚未实现、属于后续计划的**：`~/.claude/settings.json` 接管与精确还原、子 Agent frontmatter 管理（Plan 2）；
+> UI、93 条预设迁移、自定义服务商、一键获取模型（Plan 3）；托盘、开机自启、NSIS 图标与 README（Plan 4）。
+> 已知需在 Plan 3 处理：`set_file_logging` 目前无调用方（`ui.requestLogToFile` 因此是死配置）、
+> 启动时 `ConfigStore::load(...).expect(...)` 的失败需要 UI 呈现、预设/导入流程不得落盘空 key。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 交付一个可独立测试的多模型路由网关内核 —— 它监听 `127.0.0.1`，把 Claude Code 的 `/v1/messages` 请求按请求体中的 `model` 别名分发到不同厂商的 Anthropic 兼容端点，零缓冲透传 SSE。
