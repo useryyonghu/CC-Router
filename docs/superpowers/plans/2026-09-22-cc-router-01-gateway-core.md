@@ -2646,7 +2646,9 @@ pub async fn handle(req: Request<Incoming>, state: GatewayState, _peer: SocketAd
     let query = req.uri().query().map(|q| q.to_string());
     let method = req.method().as_str().to_string();
 
-    if path == "/ccr/health" {
+    // 免鉴权仅限 GET /ccr/health（spec §6.1 定义的就是这个端点）。
+    // 不能只判 path：那会让 POST /ccr/health 等所有方法都免鉴权。
+    if path == "/ccr/health" && req.method() == hyper::Method::GET {
         return health(&state);
     }
 
@@ -2735,7 +2737,15 @@ pub async fn handle(req: Request<Incoming>, state: GatewayState, _peer: SocketAd
     let headers = build_headers(&resolved, &incoming_headers).headers;
 
     let started = Instant::now();
-    let mut builder = state.client.post(&url).body(upstream_body);
+    // 必须保留入站方法：写死 post 会把所有 catch-all 请求（例如 GET /v1/organizations）
+    // 变成无 body 的 POST 打到上游——语义被静默改掉，而测试很难发现。
+    // 同时：body 为空时不要附加 body，避免给无 body 的 GET 加上 Content-Length: 0。
+    let upstream_method = reqwest::Method::from_bytes(method.as_bytes())
+        .unwrap_or(reqwest::Method::POST);
+    let mut builder = state.client.request(upstream_method, &url);
+    if !upstream_body.is_empty() {
+        builder = builder.body(upstream_body);
+    }
     for (name, value) in headers.iter() {
         builder = builder.header(name.as_str(), value.as_bytes());
     }
@@ -2895,6 +2905,8 @@ pub type Recorded = Arc<Mutex<Vec<RecordedRequest>>>;
 
 #[derive(Debug, Clone)]
 pub struct RecordedRequest {
+    /// 入站方法。必须有：否则"转发时把方法压成 POST"这类缺陷无法被测出来。
+    pub method: String,
     pub path: String,
     pub query: Option<String>,
     pub headers: Vec<(String, String)>,
@@ -2992,6 +3004,7 @@ impl MockUpstream {
                                 let handler = handler.clone();
                                 let rec = rec.clone();
                                 async move {
+                                    let method = req.method().as_str().to_string();
                                     let path = req.uri().path().to_string();
                                     let query = req.uri().query().map(|q| q.to_string());
                                     let headers = req
@@ -3004,7 +3017,7 @@ impl MockUpstream {
                                     let body_bytes = req.into_body().collect().await.unwrap().to_bytes();
                                     let body = serde_json::from_slice(&body_bytes)
                                         .unwrap_or(serde_json::Value::Null);
-                                    rec.lock().unwrap().push(RecordedRequest { path, query, headers, body });
+                                    rec.lock().unwrap().push(RecordedRequest { method, path, query, headers, body });
                                     let resp = handler().await;
                                     Ok::<_, Infallible>(resp)
                                 }
@@ -3525,7 +3538,14 @@ impl RequestLog {
 
 Run: `cargo test --manifest-path src-tauri/Cargo.toml`
 Expected: `test result: ok.` —— **lib 单元测试 52 个通过**（Task 2–5 的 51 个 + 本任务 `gateway::error` 的 1 个）
-+ **集成测试 `gateway_nonstream` 12 个通过**，合计 **64**，0 failed。
++ **集成测试 `gateway_nonstream` 15 个通过**，合计 **67**，0 failed。
+
+> **评审修复轮 1 新增的 3 个用例**（首轮实现 12 个，评审发现两处 Important 缺陷后补）：
+> - `post_to_health_requires_token` —— `POST /ccr/health` 无令牌必须 401（修掉"健康检查对所有方法免鉴权"）。
+> - `catch_all_preserves_method_and_forwards_bodyless_get` —— `GET /v1/organizations` 到上游必须仍是 GET 且无 body
+>   （修掉"catch-all 一律压成 POST"；这条缺陷此前因完全没有 catch-all 测试而被掩盖）。
+> - `token_accepts_x_api_key_header` —— 仅用 `x-api-key` 也须通过令牌校验，并断言入站本地令牌被替换为厂商密钥。
+> 前两条在这个修复轮里被证明是"修复前必然失败"的（分别打印出真实的 `200 OK` 健康检查响应、以及 `left: "POST" / right: "GET"`）。
 
 - [ ] **Step 8: Commit**
 
