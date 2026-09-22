@@ -691,7 +691,7 @@ pub fn generate_local_token() -> String {
 校验规则来自 spec §5.3。注意 `roles.*` 允许 `null`，`models_url` 允许 `null`。
 
 ```rust
-use super::{Config, ExtraRoute, Target};
+use super::{Config, Target};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -856,7 +856,7 @@ fn is_self_loop(base_url: &str, gw: &super::GatewayConfig) -> bool {
 mod tests {
     use super::*;
     use crate::config::{
-        AuthStyle, GatewayConfig, ModelSpec, Provider, Roles, TakeoverState, UiConfig,
+        AuthStyle, ExtraRoute, GatewayConfig, ModelSpec, Provider, Roles, TakeoverState, UiConfig,
         UnknownModelPolicy, DEFAULT_BIND, DEFAULT_MAX_BODY_BYTES,
     };
 
@@ -1013,7 +1013,8 @@ Expected: `test result: ok.` 全部 10 个测试通过。
 
 ```rust
 use crate::error::{Error, Result};
-use super::{validate, Config};
+use super::validate::validate;
+use super::Config;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -3677,7 +3678,7 @@ Expected: 若 Task 6 的实现真的零缓冲，则 **PASS**；若 `streams_chun
 
 - [ ] **Step 3: 补齐断连取消与空闲超时**
 
-在 `src-tauri/src/gateway/server.rs` 的流式分支中，把 `body_stream(upstream.bytes_stream())` 换成带空闲超时与取消的版本，并**删掉 Task 6 里那行 `let _ = idle_timeout_ms; // Task 7 的流式分支使用它`**（它已不再被丢弃）：
+在 `src-tauri/src/gateway/server.rs` 的流式分支中，把 `body_stream(upstream.bytes_stream())` 换成带空闲超时与取消的版本，并**删掉 Task 6 里那行 `let _ = idle_timeout_ms; // Task 7 的流式分支使用它`**（它已不再被丢弃）。同时在 `server.rs` 顶部加上 `use futures_util::StreamExt;` —— `idle_guarded` 里调用 `s.next()` 需要该 trait 在作用域内，否则编译报错 `no method named next found`：
 
 ```rust
 let idle = std::time::Duration::from_millis(idle_timeout_ms);
