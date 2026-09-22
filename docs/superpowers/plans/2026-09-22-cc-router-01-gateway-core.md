@@ -3573,7 +3573,9 @@ spec §6.6 是硬约束：**不得缓冲**。本任务的测试用"块间 sleep 
 ```rust
 mod support;
 
-use futures_util::StreamExt;
+// 注意：这里**不要** `use futures_util::StreamExt;`——本文件里 `join_all` 用的是全限定路径
+// `futures_util::future::join_all`，`read_to_string` 来自 `tokio::io::AsyncReadExt`，
+// 所以 StreamExt 完全没被用到，加了会产生 `unused_imports` 警告（而警告算评审发现）。
 use std::time::{Duration, Instant};
 use support::{start_gateway, test_config, MockUpstream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -3705,8 +3707,10 @@ async fn handles_sixteen_concurrent_streams_without_crosstalk() {
     let results = futures_util::future::join_all(handles).await;
     for r in results {
         let text = r.unwrap();
-        assert_eq!(text.matches("message_start").count(), 1, "crosstalk detected: {text}");
-        assert_eq!(text.matches("message_stop").count(), 1, "crosstalk detected: {text}");
+        // 必须数帧头（`event: message_start`），不能数裸子串：本文件 `sse_chunks` 的首块同时含
+        // `event: message_start` 与 `"type":"message_start"`，裸子串计数恒为 2，断言 `== 1` 不可能成立。
+        assert_eq!(text.matches("event: message_start").count(), 1, "crosstalk detected: {text}");
+        assert_eq!(text.matches("event: message_stop").count(), 1, "crosstalk detected: {text}");
     }
     assert_eq!(upstream.requests().len(), 16);
 
@@ -3883,7 +3887,13 @@ where
 - [ ] **Step 4: 重跑流式测试**
 
 Run: `cargo test --manifest-path src-tauri/Cargo.toml --test gateway_stream`
-Expected: `test result: ok.`，8 个测试全部通过。
+Expected: `test result: ok.`，8 个测试全部通过（全库合计 75 = 52 lib + 15 `gateway_nonstream` + 8 `gateway_stream`）。
+
+> **已知覆盖缺口（评审已记录，交给 Task 8 或后续补齐）**：这 8 个用例里没有一个会触发空闲超时
+> （`test_config` 的 `idle_timeout_ms = 300_000`），所以 `idle_guarded` 里 `Err(_elapsed)` 那条分支
+> **没有已提交的测试pin**。实现时用临时用例验证过（`idle = 300ms` + 上游块间隔 2s → 下游在 306.78ms
+> 干净收流且未送达任何块；把 `server.rs` 回退到 Task 6 版本后同一条流会跑满 10.04s），但临时用例已删除。
+> 另外：空闲超时导致的下游截断与"正常结束"在下游不可区分（不发错误帧），这是 brief 指定的行为。
 
 - [ ] **Step 5: 重跑全部测试确保无回归**
 
