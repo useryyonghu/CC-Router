@@ -1434,7 +1434,9 @@ mod tests {
         assert_eq!(derive_provider_id("https://api.deepseek.com/anthropic", &none()), "deepseek");
         assert_eq!(derive_provider_id("https://api.xiaomimimo.com/anthropic", &none()), "xiaomimimo");
         assert_eq!(derive_provider_id("https://open.bigmodel.cn/api/anthropic", &none()), "bigmodel");
-        assert_eq!(derive_provider_id("http://127.0.0.1:9000/v1", &none()), "127-0-0");
+        // IPv4 主机名：只保留首段（"127" 已满足 ^[a-z0-9][a-z0-9-]{0,31}$）。
+        // 这是刻意的简化——本地 provider 的 id 通常由用户改写，不值得为它做多段拼接。
+        assert_eq!(derive_provider_id("http://127.0.0.1:9000/v1", &none()), "127");
     }
 
     #[test]
@@ -2376,7 +2378,6 @@ use crate::gateway::error::{anthropic_error, ErrorKind};
 use crate::gateway::rewrite::{build_headers, rewrite_body, upstream_url, RewriteError};
 use crate::routing::resolve::{ResolveError, RouteTable};
 use crate::error::{Error, Result};
-use bytes::Bytes;
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
