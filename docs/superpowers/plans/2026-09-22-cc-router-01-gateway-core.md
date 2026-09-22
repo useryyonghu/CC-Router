@@ -2402,7 +2402,10 @@ git commit -m "feat(gateway): 请求体模型改写、鉴权注入与 1M beta �
   - `cc_router::gateway::body::{BoxedBody, body_full, body_stream}`
   - `cc_router::gateway::server::{Gateway, GatewayState, start, start_with_port}`
   - `Gateway { bound_port: u16, shutdown() }`
-  - 测试支撑：`tests/support::mock_upstream::{MockUpstream, MockResponse}`
+  - 测试支撑：`tests/support/mod.rs` 暴露 `MockUpstream`（`start_json` / `start_raw` / `start_sse` /
+    `requests` / `shutdown`，公开字段 `base_url`、`port`）、`RecordedRequest`（含 `header(name)`）、
+    `test_config`、`ok_message_body`、`start_gateway` 与类型别名 `BoxedMockBody`。
+    （**没有** `MockResponse` 类型——早先这里写错过，代码里从来不存在它，Task 7/8 也不需要。）
 
 - [ ] **Step 1: 写 `src-tauri/src/gateway/error.rs`**
 
@@ -2483,13 +2486,21 @@ pub fn body_full(bytes: impl Into<Bytes>) -> BoxedBody {
 }
 
 /// 把任意 `Result<Bytes, E>` 流包成响应体。**不做任何缓冲**：每一块到达即作为一帧下发。
+///
+/// `S` 必须 `Sync`：`BoxBody` 的内部是 `Pin<Box<dyn Body<..> + Send + Sync + 'static>>`，
+/// 所以 `BodyExt::boxed` 要求 `Self: Send + Sync`，而 `StreamBody<Map<S, F>>` 只有在 `S: Sync`
+/// 时才是 `Sync`。唯一的调用点 `reqwest::Response::bytes_stream()` 满足该约束。
+///
+/// 另外必须写成 `BodyExt::boxed(...)` 而不是 `.boxed()`：`http-body-util` 0.1.5 同时为
+/// `StreamBody` 实现了 `Body` 与 `Stream`，而本文件两个 trait 都在作用域内，方法调用会二义
+/// （E0034）。
 pub fn body_stream<S, E>(stream: S) -> BoxedBody
 where
-    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    S: Stream<Item = Result<Bytes, E>> + Send + Sync + 'static,
     E: std::error::Error + Send + Sync + 'static,
 {
     let mapped = stream.map(|item| item.map(Frame::data).map_err(|e| -> BoxedError { Box::new(e) }));
-    StreamBody::new(mapped).boxed()
+    BodyExt::boxed(StreamBody::new(mapped))
 }
 ```
 
@@ -2528,6 +2539,7 @@ pub struct GatewayState {
     pub log: crate::logging::RequestLog,
 }
 
+#[derive(Debug)]
 pub struct Gateway {
     pub bound_port: u16,
     requests_served: Arc<AtomicU64>,
@@ -2859,11 +2871,19 @@ fn rewrite_error_message(e: &RewriteError, requested: &str) -> String {
 - [ ] **Step 4: 写 `src-tauri/tests/support/mod.rs`（mock 上游）**
 
 ```rust
+//! 集成测试共用的脚手架：一个可编程的 mock 上游 + 配置夹具。
+//!
+//! 本模块同时服务 Task 6 / 7 / 8，因此**故意**暴露了在 Task 6 尚未被用到的成员
+//! （`start_sse`、`async_stream_like`、公开字段 `port`、`RecordedRequest::query`）。
+//! 若不加 `allow(dead_code)`，这些"为后续任务预留的接口"会产生 4 条 dead_code 警告，
+//! 而删掉它们又会破坏后续任务依赖的接口——所以在模块级一次性豁免。
+#![allow(dead_code)]
+
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Frame;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use std::convert::Infallible;
@@ -3504,7 +3524,8 @@ impl RequestLog {
 - [ ] **Step 7: 运行全部测试**
 
 Run: `cargo test --manifest-path src-tauri/Cargo.toml`
-Expected: `test result: ok.` —— 单元测试（含 Task 2–5 的）+ 集成测试 `gateway_nonstream` 的 12 个测试全部通过。
+Expected: `test result: ok.` —— **lib 单元测试 52 个通过**（Task 2–5 的 51 个 + 本任务 `gateway::error` 的 1 个）
++ **集成测试 `gateway_nonstream` 12 个通过**，合计 **64**，0 failed。
 
 - [ ] **Step 8: Commit**
 
