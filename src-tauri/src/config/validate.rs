@@ -27,6 +27,15 @@ fn valid_provider_id(s: &str) -> bool {
         .all(|b| matches!(*b as char, 'a'..='z' | '0'..='9' | '-'))
 }
 
+/// api_key 必须能作为 HTTP 请求头的值发送：非空、无首尾空白、且只含可打印 ASCII。
+/// 这正是 `HeaderValue::from_str` 会接受的范围（外加 tab），但在这里判定可避免
+/// 让 `config` 依赖 HTTP 层。
+fn valid_api_key(s: &str) -> bool {
+    !s.trim().is_empty()
+        && s == s.trim()
+        && s.bytes().all(|b| b == b'\t' || (0x20..=0x7e).contains(&b))
+}
+
 pub fn validate(cfg: &Config) -> Result<(), Vec<ConfigError>> {
     let mut errs = Vec::new();
 
@@ -69,6 +78,12 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<ConfigError>> {
             if !(mu.starts_with("http://") || mu.starts_with("https://")) {
                 errs.push(ConfigError::new(pf("modelsUrl"), "只能是完整 http(s):// URL 或 null"));
             }
+        }
+        if !valid_api_key(&p.api_key) {
+            errs.push(ConfigError::new(
+                pf("apiKey"),
+                "密钥不能为空，不能含首尾空白，且只能包含可打印 ASCII 字符（否则无法作为 HTTP 请求头发送）",
+            ));
         }
         let mut model_ids: HashSet<&str> = HashSet::new();
         for (mi, m) in p.models.iter().enumerate() {
@@ -297,6 +312,41 @@ mod tests {
         let errs = validate(&cfg).unwrap_err();
         assert!(errs.iter().any(|e| e.field == "providers[0].id"));
         assert!(errs.iter().any(|e| e.field == "providers[0].modelsUrl"));
+    }
+
+    #[test]
+    fn rejects_empty_or_whitespace_only_api_key() {
+        for empty in ["", "   "] {
+            let mut cfg = base_cfg();
+            cfg.providers[0].api_key = empty.to_string();
+            let errs = validate(&cfg).unwrap_err();
+            assert!(
+                errs.iter().any(|e| e.field == "providers[0].apiKey"),
+                "api_key={empty:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_api_key_with_non_ascii_characters() {
+        let mut cfg = base_cfg();
+        cfg.providers[0].api_key = "sk-密钥".to_string();
+        let errs = validate(&cfg).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.field == "providers[0].apiKey"),
+            "a non-ASCII key cannot be sent as a header value and must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_api_key_with_surrounding_whitespace() {
+        let mut cfg = base_cfg();
+        cfg.providers[0].api_key = " sk-real ".to_string();
+        let errs = validate(&cfg).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.field == "providers[0].apiKey"),
+            "surrounding whitespace is a paste error and must be rejected"
+        );
     }
 
     #[test]
