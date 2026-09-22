@@ -1,6 +1,7 @@
 pub mod app_paths;
 pub mod config;
 pub mod error;
+pub mod routing;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
