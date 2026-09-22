@@ -2,7 +2,8 @@ use crate::error::{Error, Result};
 use super::validate::validate;
 use super::Config;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// 原子写：同目录临时文件 → rename 覆盖。父目录不存在则创建。
 pub fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -17,9 +18,13 @@ pub fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<
     Ok(())
 }
 
+/// 进程内单调递增，保证同一进程内每次临时文件名都不同。
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn tmp_sibling(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".tmp.{}", std::process::id()));
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    name.push(format!(".tmp.{}.{}", std::process::id(), n));
     path.with_file_name(name)
 }
 
@@ -54,17 +59,28 @@ pub fn load_or_init(path: &Path) -> Result<Config> {
 pub struct ConfigStore {
     path: PathBuf,
     inner: Arc<RwLock<Config>>,
+    /// 串行化 `save` 的 校验 → 落盘 → 改内存 全过程。
+    /// 必须是 `Arc`：`ConfigStore` 可 `Clone`，所有克隆必须共用同一把锁。
+    save_lock: Arc<Mutex<()>>,
 }
 
 impl ConfigStore {
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let cfg = load_or_init(&path)?;
-        Ok(ConfigStore { path, inner: Arc::new(RwLock::new(cfg)) })
+        Ok(ConfigStore {
+            path,
+            inner: Arc::new(RwLock::new(cfg)),
+            save_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     /// 替换内存配置并原子落盘。校验失败则内存与磁盘都不变。
+    ///
+    /// 全程持锁：否则两次并发 save 的落盘顺序与改内存顺序可能不一致，
+    /// 导致磁盘与内存里是两份不同的配置。
     pub fn save(&self, next: Config) -> Result<()> {
+        let _guard = self.save_lock.lock().expect("save lock poisoned");
         validate(&next)
             .map_err(|errs| Error::ConfigInvalid(errs.iter().map(|e| format!("{}: {}", e.field, e.message)).collect::<Vec<_>>().join("; ")))?;
         atomic_write_json(&self.path, &next)?;
@@ -200,5 +216,45 @@ mod tests {
         assert_ne!(a, b);
         let hex = a.trim_start_matches("sk-ccr-");
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn tmp_sibling_names_are_unique_across_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let a = tmp_sibling(&path);
+        let b = tmp_sibling(&path);
+        assert_ne!(a, b, "temp name must not be reused: {a:?} vs {b:?}");
+        assert_eq!(a.parent(), path.parent(), "temp file must be a same-dir sibling");
+        assert_eq!(b.parent(), path.parent());
+        let name = a.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("config.json.tmp."), "unexpected temp name: {name}");
+    }
+
+    #[test]
+    fn concurrent_saves_keep_disk_and_memory_in_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let store = ConfigStore::load(&path).unwrap();
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let clone = store.clone();
+                std::thread::spawn(move || {
+                    let mut cfg = demo_cfg();
+                    cfg.gateway.port = 9000 + i;
+                    cfg.gateway.local_token = format!("sk-ccr-thread-{i}");
+                    clone.save(cfg).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let text = std::fs::read_to_string(store.path()).unwrap();
+        let parsed: Config = serde_json::from_str(&text).expect("file on disk must be valid JSON");
+        assert_eq!(parsed, store.snapshot(), "disk and memory must agree");
+        assert_eq!(load_from(store.path()).unwrap(), store.snapshot());
     }
 }
