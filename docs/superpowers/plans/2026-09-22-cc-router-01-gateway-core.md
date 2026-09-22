@@ -1016,7 +1016,8 @@ use crate::error::{Error, Result};
 use super::validate::validate;
 use super::Config;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// 原子写：同目录临时文件 → rename 覆盖。父目录不存在则创建。
 pub fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -1031,9 +1032,14 @@ pub fn atomic_write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<
     Ok(())
 }
 
+/// 进程内单调计数器：保证同一进程内两次写的临时文件名不同。
+/// 只用 PID 会让两个并发写共享同一个临时文件，从而互相覆盖彼此的内容。
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn tmp_sibling(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".tmp.{}", std::process::id()));
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    name.push(format!(".tmp.{}.{}", std::process::id(), n));
     path.with_file_name(name)
 }
 
@@ -1068,17 +1074,29 @@ pub fn load_or_init(path: &Path) -> Result<Config> {
 pub struct ConfigStore {
     path: PathBuf,
     inner: Arc<RwLock<Config>>,
+    /// 串行化 save。必须是 `Arc`：`ConfigStore` 派生了 `Clone`，所有克隆只有共享同一把锁
+    /// 才能互斥；裸 `Mutex` 会让每个克隆各持一把锁，等于没锁。
+    save_lock: Arc<Mutex<()>>,
 }
 
 impl ConfigStore {
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let cfg = load_or_init(&path)?;
-        Ok(ConfigStore { path, inner: Arc::new(RwLock::new(cfg)) })
+        Ok(ConfigStore {
+            path,
+            inner: Arc::new(RwLock::new(cfg)),
+            save_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     /// 替换内存配置并原子落盘。校验失败则内存与磁盘都不变。
+    ///
+    /// 全程持 `save_lock`：磁盘顺序（rename）与内存顺序（RwLock 获取）如果各自独立，
+    /// 两个并发 save 会以不同次序落地，导致磁盘与内存指向不同的配置。
+    /// 锁必须在 `atomic_write_json` 之前获取、在内存赋值之后释放。
     pub fn save(&self, next: Config) -> Result<()> {
+        let _guard = self.save_lock.lock().expect("save lock poisoned");
         validate(&next)
             .map_err(|errs| Error::ConfigInvalid(errs.iter().map(|e| format!("{}: {}", e.field, e.message)).collect::<Vec<_>>().join("; ")))?;
         atomic_write_json(&self.path, &next)?;
@@ -1215,6 +1233,45 @@ mod tests {
         let hex = a.trim_start_matches("sk-ccr-");
         assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
+
+    /// 临时文件名必须每次不同：只用 PID 时两个并发写会共用同一个临时文件并互相覆盖。
+    #[test]
+    fn tmp_sibling_names_are_unique_across_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let a = tmp_sibling(&path);
+        let b = tmp_sibling(&path);
+        assert_ne!(a, b, "temp name must not be reused: {a:?} vs {b:?}");
+    }
+
+    /// 并发 save 结束后磁盘与内存必须一致。
+    /// 该用例在"save 不串行 + 临时名只用 PID"的旧实现下会真实失败
+    /// （曾经复现出磁盘=thread-7、内存=thread-4 的分叉），因此它不是一个恒真断言。
+    #[test]
+    fn concurrent_saves_keep_disk_and_memory_in_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let store = ConfigStore::load(&path).unwrap();
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    let mut cfg = Config::first_run();
+                    cfg.gateway.port = 9000 + i;
+                    cfg.gateway.local_token = format!("sk-ccr-thread-{i}");
+                    store.save(cfg).expect("save must succeed");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("save thread must not panic");
+        }
+
+        let on_disk = load_from(&path).unwrap();
+        let in_memory = store.snapshot();
+        assert_eq!(on_disk, in_memory, "disk and memory must agree");
+    }
 }
 ```
 
@@ -1238,7 +1295,7 @@ pub fn run() {
 - [ ] **Step 8: 运行本任务全部测试**
 
 Run: `cargo test --manifest-path src-tauri/Cargo.toml`
-Expected: `test result: ok.`，共 17 个测试通过（10 校验 + 7 store），0 failed。
+Expected: `test result: ok.`，共 19 个测试通过（10 校验 + 9 store），0 failed。
 
 - [ ] **Step 9: Commit**
 
