@@ -32,6 +32,7 @@ Claude Code 只允许配置**一个**第三方模型端点（`ANTHROPIC_BASE_URL
 3. 实现「主 agent 用 A 厂商、subagent 用 B 厂商」以及「某个具体子 agent 用 C 厂商」。
 4. 由应用自动接管 `~/.claude/settings.json`（仅改动自己拥有的键），并提供**精确到字节的一键还原**。
 5. 真密钥不写入 `~/.claude/settings.json`——该文件只出现本地令牌。
+6. 提供**厂家预设**（选中厂商即自动填好 baseUrl、鉴权风格、模型列表接口、取密钥的控制台链接）与**一键获取模型列表**（直接向厂商拉取可用模型，多选后批量加入配置），把"手工抄 URL、手工敲模型名"降到最低。
 
 ### 2.2 非目标（本期明确不做）
 - 故障转移、多目标权重、健康探测式熔断。
@@ -50,6 +51,7 @@ Claude Code 只允许配置**一个**第三方模型端点（`ANTHROPIC_BASE_URL
 | **别名（alias）** | 本网关对外暴露的虚拟模型 ID，形如 `ccr-kimi-k3`。Claude Code 只会看到别名 |
 | **角色（role）** | 三类槽位：`main`（主 agent）、`fast`（后台/快速任务）、`subagent`（子 agent 默认） |
 | **目标（target）** | 一个 `(providerId, modelId)` 二元组 |
+| **预设（preset）** | 一个厂商的连接信息模板（baseUrl / 鉴权风格 / 模型列表接口 / 取密钥链接），来自内置数据文件或用户覆盖文件 |
 | **接管（takeover）** | 把本网关地址与别名写入 `~/.claude/settings.json` 的 `env` 块 |
 
 ## 4. 架构
@@ -122,6 +124,13 @@ Claude Code 会把「当前角色所选定的模型名」原样放进 `/v1/messa
       "baseUrl": "https://api.moonshot.cn/anthropic",
       "apiKey": "sk-...",                  // 明文
       "authStyle": "both",                 // both | x-api-key | bearer
+      "presetId": "kimi",                  // 来自哪个预设；手动创建为 null
+      "modelsPath": null,                  // 模型列表接口：null=自动探测（见 5.7）；可为相对路径或完整 URL
+      "modelsFetch": {                     // 最近一次"一键获取"的元信息，null 表示从未拉取
+        "lastAt": "2026-09-22T10:00:00+08:00",
+        "lastUrl": "https://api.moonshot.cn/v1/models",   // 实际试通的那个 URL
+        "count": 12
+      },
       "models": [
         {
           "id": "k3",                      // 上游真实模型名（不含 [1M] 后缀）
@@ -168,6 +177,7 @@ Claude Code 会把「当前角色所选定的模型名」原样放进 `/v1/messa
 - 同一 provider 内 `models[].id` 唯一；全局 `alias` 唯一。
 - `roles.*`（非 `null` 时）与 `defaultTarget` 必须指向存在的 `(providerId, modelId)`。
 - `extraRoutes[].alias` 不得与任何模型的默认别名冲突。
+- `modelsPath` 只能是 `null`、以 `/` 开头的相对路径、或完整 `http(s)://` URL。
 - `gateway.port` ∈ [1024, 65535]。
 - 子 agent 的模型指派**不进 config.json**：唯一来源是 `~/.claude/agents/*.md` 的 frontmatter，避免双份事实来源。
 - 校验失败时：UI 拒绝保存并指明字段；若启动时读到的 config.json 校验失败，网关**不启动**，UI 显示明确错误（不静默用默认值覆盖用户文件）。
@@ -180,6 +190,75 @@ Claude Code 会把「当前角色所选定的模型名」原样放进 `/v1/messa
 
 ### 5.5 热生效
 UI 保存 → 后端校验 → 原子写盘 → 更新 `Arc<RwLock<Config>>` → 网关下一请求即生效，**无需重启**。唯一例外：修改 `gateway.port` 需要重启网关（UI 明确提示并提供「立即重启网关」按钮）。
+
+### 5.6 厂家预设（presets）
+预设是**数据，不是代码**：内置 `presets.json` 随应用打包；用户可在 `%APPDATA%\cc-router\presets.user.json` 追加或覆盖（同 `id` 覆盖内置），**无需重新打包应用**。
+
+```jsonc
+{
+  "version": 1,
+  "presets": [{
+    "id": "deepseek",
+    "name": "DeepSeek 官方",
+    "baseUrl": "https://api.deepseek.com/anthropic",
+    "authStyle": "both",
+    "modelsPath": null,                     // null = 按 5.7 自动探测
+    "docsUrl": "https://api-docs.deepseek.com/",
+    "apiKeyUrl": "https://platform.deepseek.com/api_keys",   // UI 一键打开取密钥页
+    "defaultModels": [ { "id": "deepseek-v4-pro", "name": "deepseek-v4-pro" } ],
+    "notes": "baseUrl 已在本机现有可用配置中验证",
+    "verifiedAt": "2026-09-22"
+  }]
+}
+```
+
+- 选中预设 → 预填 `baseUrl` / `authStyle` / `modelsPath` / `presetId`，并展示 `docsUrl` 与 `apiKeyUrl` 链接。**预设不含、也绝不自动填写密钥。**
+- `defaultModels` 是"一键获取失败"时的**离线兜底候选**（见 5.7），由用户勾选后加入。
+- **诚实标注**：`verifiedAt` 为 `null` 的预设，UI 显示"未验证"角标。
+- **首版内置范围**
+  - 已在本机实际配置中验证：**DeepSeek 官方**（`https://api.deepseek.com/anthropic`，见 `~/.claude/envs.json` 的可用预设）、**小米 MiMo**（`https://api.xiaomimimo.com/anthropic`，见当前生效的 `settings.json`）、**Anthropic 官方**。
+  - 需在 M4 阶段用真实端点逐个验证后才标 `verifiedAt`：**Kimi / Moonshot**（`~/.dsh/settings.yaml` 里只有 `kimi-coding` 的 provider 名与密钥引用，未暴露 baseUrl）、智谱 GLM、通义千问、硅基流动、OpenRouter 等常见厂商。
+  - 验证不通过的条目：保留但标 `verifiedAt: null`，或从内置列表移除。**绝不把未经验证的 URL 当作可用预设提供。**
+
+> 反例警示：cc-switch 出现过"预设生成的 config 与官方文档不一致，且自动拉取模型列表不通"（[issue #6566](https://github.com/farion1231/cc-switch/issues/6566)）。因此本设计把"预设 URL 必须实测"与"拉取失败必须有出路"作为硬要求，并把预设做成可被用户覆盖的数据文件——厂商改 URL 时不必等应用发版。
+
+### 5.7 一键获取模型列表
+
+**请求**：**自动探测**依次尝试以下 3 个候选 URL，命中即停；若 `modelsPath` 已显式设置，则只试它（不再探测）：
+
+1. `provider.modelsPath`
+2. `{baseUrl}/v1/models`（Anthropic 兼容约定）
+3. 去掉已知路径后缀（`/anthropic`、`/api/anthropic`）后的**站点根** + `/v1/models`（OpenAI 兼容约定）
+
+失败后用户还可以在 UI 中**手动填入完整 URL** 重试（这条不是自动探测的一部分，见下方"失败处理"）。
+
+- 鉴权：复用 provider 的 `authStyle` 注入真实密钥（与网关同一套逻辑）。
+- 超时 15s。结果写入 `modelsFetch`，并把试通的 URL 记入 `modelsFetch.lastUrl`，下次优先试它。
+
+**响应解析**：Anthropic 与 OpenAI 两种形状都接受（二者共用 `data[].id`），并防御性接受裸数组 `[…]`：
+
+```
+Anthropic: { "data": [{ "type": "model", "id": "…", "display_name": "…" }], "has_more": false }
+OpenAI:    { "object": "list", "data": [{ "id": "…", "object": "model", "created": … }] }
+```
+
+可提取的附加字段：`display_name` / `name`、`created`、`context_length` / `context_window` / `max_input_tokens`、`max_output_tokens` / `max_tokens`。
+
+> 这里只是**解析列表响应**，不属于 §2.2 所排除的"OpenAI 协议翻译"——消息转发（`/v1/messages`）仍然只支持 Anthropic 兼容上游。
+
+**选择与写入**
+- 结果以多选列表呈现，带**搜索框**（部分厂商有 300+ 模型）与全选/反选。
+- 疑似非对话模型（`id` 命中 `embed`/`embedding`/`rerank`/`tts`/`whisper`/`audio`/`image`/`moderation`/`dall-e` 等）默认**不勾选**但可见，并标"疑似非对话模型"。
+- 已存在于该 provider 的模型显示「已添加」，不可重复加入。
+- 加入时逐条生成：`id`（自动剥离结尾 `[1m]` 并把 `context1m` 置 `true`）、`name`（`display_name` 优先）、`alias`（按 5.4）、`contextWindow` / `maxTokens`（响应里有则填，否则 `null`）。
+- `contextWindow` / `maxTokens` **仅用于界面展示**；网关不依赖它们（`max_tokens` 由 Claude Code 自己发送）。
+
+**失败处理（一等公民，不允许静默失败）**
+- 全部候选失败时，列出**每个候选 URL 的尝试结果**（状态码 / 错误摘要），并给出三条出路：
+  1. 手动填入完整模型列表 URL 重试；
+  2. 手动输入模型名（走已有的模型 CRUD）；
+  3. 使用该预设的 `defaultModels` 作为离线兜底候选。
+- 常见原因在 UI 直接解释：401（密钥错或无权限）、404（厂商不提供模型列表接口）、403（地区或账号限制）。
 
 ## 6. 网关规格
 
@@ -309,7 +388,7 @@ CLAUDE_CODE_SUBAGENT_MODEL     = <roles.subagent 所指模型的别名>
 ### 7.4 防呆与外部冲突告警
 - 应用启动时与每次接管后校验：`settings.json` 的 `ANTHROPIC_BASE_URL` 是否仍等于本网关地址。
   - 不等于 → 顶部横幅：「接管已失效，settings.json 被其它程序改写（可能是 cc-switch）」，并提供〔重新接管〕〔还原〕按钮。
-- **与 cc-switch 的已知冲突**：cc-switch 的 `enableLocalProxy` 会写入同一个 `env` 块，两者会互相覆盖。缓解措施：检测到 `~/.cc-switch/settings.json` 存在且 `enableLocalProxy=true` 时，在 UI 显示一次性提示，建议二者择一或关闭 cc-switch 的本地代理。**不做自动重写循环**（避免与 cc-switch 互抢）。
+- **与 cc-switch 的关系（已与用户确认）**：用户不使用 cc-switch 的路由模式（`enableLocalProxy` 会保持关闭），两者不构成实际冲突。因此只保留通用的"外部改写检测 + 横幅告警"（成本低，且对任何写入者都有效），**不针对 cc-switch 做专门检测，也不做自动重写循环**。
 - 网关未运行但已接管 → UI 红色状态 + 明确提示「此时 Claude Code 无法使用，请启动网关或点还原」。
 
 ## 8. 子 Agent 管理
@@ -361,10 +440,11 @@ CLAUDE_CODE_SUBAGENT_MODEL     = <roles.subagent 所指模型的别名>
 - 顶部状态区实时显示「主 agent → X 厂商 / subagent → Y 厂商」，直接用 5.2 的 `roles` 渲染。
 
 ### 10.2 服务商
-- 表格：名称、baseUrl、模型数、启用状态。
-- 编辑表单：`id`、`name`、`baseUrl`、`apiKey`（密文显示 + 切换明文）、`authStyle`、模型列表 CRUD（`id`、`name`、`alias`(自动生成，可改)、`context1m`、`contextWindow`、`maxTokens`）。
+- 表格：名称、baseUrl、模型数、启用状态、上次拉取时间。
+- **新建服务商的第一步是选厂家预设**（下拉 + 搜索，带"已验证/未验证"角标）：选中即自动填好 `baseUrl` / `authStyle` / `modelsPath`，并给出 `docsUrl`、`apiKeyUrl`（一键打开厂商取密钥页）；同时支持"从空白创建"。
+- 编辑表单：`id`、`name`、`baseUrl`、`apiKey`（密文显示 + 切换明文）、`authStyle`、`modelsPath`、模型列表 CRUD（`id`、`name`、`alias`(自动生成，可改)、`context1m`、`contextWindow`、`maxTokens`）。
 - `测试连接`：向该 provider 发一条最小 `POST /v1/messages`（`max_tokens: 16`，单轮 user），15s 超时，显示状态码、延迟、错误消息。
-- **内置模板**（一键填充 baseUrl/authStyle）：DeepSeek 官方、Kimi / Moonshot、小米 MiMo、Anthropic 官方。模板只填 URL 与鉴权风格，不含密钥。
+- `一键获取模型`：见 5.7。拉取成功后多选加入；失败时展示**每个候选 URL 的尝试结果**与三条出路。列表顶部显示"上次拉取：时间 / 来源 URL / 数量"，从未拉取时提示"可一键获取"。
 
 ### 10.3 角色路由
 - 三个下拉：`main` / `fast` / `subagent`，选项为"provider / 模型"两级展开的全部已配置模型；每个下拉旁显示将写入的别名。
@@ -396,7 +476,12 @@ CLAUDE_CODE_SUBAGENT_MODEL     = <roles.subagent 所指模型的别名>
 - `[1M]` 判定与 beta 头追加（去重、与既有 `anthropic-beta` 合并、上游模型名不含后缀）。
 - 鉴权注入三种 `authStyle`；确认客户端原始鉴权头被剥离。
 - 请求头过滤/透传白名单；`content-length` 重算。
-- 配置校验各条规则（含 baseUrl 自环检测）。
+- 配置校验各条规则（含 baseUrl 自环检测、`modelsPath` 形式校验）。
+- 预设加载与合并：内置 `presets.json` + 用户 `presets.user.json` 同 `id` 覆盖；`verifiedAt: null` 的角标标注逻辑。
+- 模型列表响应解析：Anthropic 形状 / OpenAI 形状 / 裸数组 / 缺字段 / 空列表。
+- 疑似非对话模型的识别启发式。
+- 模型 id 结尾 `[1m]` 被剥离且 `context1m` 置 `true`。
+- 获取模型的候选 URL 顺序与"命中即停"；全部失败时各候选结果的聚合。
 - 错误体构造：401 / 400 / 413 / 502 / 504 的 JSON 形状与 `error.type`。
 
 ### 11.2 集成测试（不访问外网）
@@ -408,6 +493,8 @@ CLAUDE_CODE_SUBAGENT_MODEL     = <roles.subagent 所指模型的别名>
 - 大请求体：超过上限返回 413。
 - 接管夹具测试：对 `settings.json` 的多种夹具（不存在 / `{}` / 缺 env / 有多余键 / 已有我们全部键 / 非法 JSON）断言「接管 → 还原」字节级等于原文件，并断言备份内容等于原文件。
 - 子 agent 夹具测试：断言只改 `model` 行，frontmatter 其它字段与正文未变；还原后字节级等于原文件。
+- **一键获取模型**：mock 上游让候选 1 返回 404、候选 2 返回 200，断言最终采用候选 2、`modelsFetch.lastUrl` 记录正确、模型解析正确、拉取请求带上了正确鉴权头；再断言下一次拉取优先试 `lastUrl`。
+- 拉取全部失败：断言返回信息足以渲染三条出路（含每个候选的 URL 与状态码）。
 
 ### 11.3 手工 E2E 验收清单（真 Claude Code + 真厂商）
 1. `roles`: main=Kimi、subagent=DeepSeek、fast=DeepSeek → 一键接管 → 重启 `claude`。
@@ -429,19 +516,24 @@ CLAUDE_CODE_SUBAGENT_MODEL     = <roles.subagent 所指模型的别名>
 | AC7 | `claude-haiku-*` 无别名命中时走 `roles.fast` |
 | AC8 | 接管后 settings.json 仅新增我们拥有的键、其它键不变、备份文件存在；还原后字节级等于接管前 |
 | AC9 | 手工 E2E 第 2、3 步通过（主 agent 与 subagent 命中不同 provider） |
+| AC10 | 选择任一预设后 `baseUrl` / `authStyle` / `modelsPath` 被正确预填，且 `apiKey` 保持为空 |
+| AC11 | `一键获取模型` 能从 mock 上游解析出模型列表并把所选模型写入 provider；全部候选失败时 UI 展示每个候选的 URL 与状态，并给出三条出路 |
+| AC12 | 每个内置预设的 `baseUrl` 都经过实测：通过者标 `verifiedAt`，未通过者标 `null` 并有"未验证"角标 |
 
 ## 12. 打包与交付
 - `pnpm tauri build` 产出 NSIS 安装包（`.exe`，预期 5–10 MB）+ 可选 MSI。
 - 托盘图标 + 右键菜单（显示主窗口 / 启停网关 / 接管 / 还原 / 退出）。
 - 开机自启（Tauri autostart 插件）。
-- 交付物：安装包、README（安装、首次配置、接管/还原、与 cc-switch 的冲突说明、故障排查、明文密钥警示）。
+- 内置 `presets.json`（厂家预设数据；可被 `%APPDATA%\cc-router\presets.user.json` 覆盖，厂商改 URL 时无需等应用发版）。
+- 交付物：安装包、README（安装、首次配置、厂家预设与一键获取模型、接管/还原、外部改写告警、故障排查、明文密钥警示）。
 
 ## 13. 风险与缓解
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
 | **cargo/crates.io 不可达**，Tauri 全量构建需数百 crate（缓存中仅部分存在） | 阻塞全部工作 | **实施第 0 步**：先构建"空 Tauri + Vue3 + Naive UI"骨架并产出 exe，验证工具链并预热缓存；不通则切 rsproxy/TUNA 镜像（`~/.cargo` 已有 TUNA 缓存痕迹） |
-| 与 cc-switch 争抢 `settings.json` | 接管随机失效 | 7.4：启动/接管后校验 + 横幅告警 + 检测 `enableLocalProxy` 一次性提示；不做自动重写循环 |
+| 与 cc-switch 争抢 `settings.json` | 低（用户不使用 cc-switch 路由模式） | 7.4：只保留通用"外部改写检测 + 横幅告警"，不做专门检测、不做自动重写循环 |
+| **预设 baseUrl 与厂商实际不符**，或厂商不提供模型列表接口 | 用户按预设建好却连不通 / 拉不到模型 | 5.6 要求逐个实测并标 `verifiedAt`，未验证的显示角标；预设为可覆盖的数据文件；5.7 多候选探测 + 失败三出路（见 cc-switch [#6566](https://github.com/farion1231/cc-switch/issues/6566) 的反例） |
 | 上游 provider 拒绝未知 `anthropic-beta` 值 | 请求失败 | 只透传客户端已有 beta（本机已证明对 MiMo 可行）；我们**新增**的 1M beta 仅由 `context1m=true` 显式开启，默认关闭 |
 | 某些 provider 对 `[1M]` 后缀或 `x-api-key`/`Bearer` 支持不一致 | 请求被拒 | 网关统一剥离后缀；`authStyle=both` 同时发两种头，可按 provider 覆盖 |
 | Claude Code 版本变化导致 `ANTHROPIC_DEFAULT_*_MODEL` 语义或 env 键变动 | 别名路由失效 | 家族兜底（6.2 第 2 步）作为不依赖 env 的第二道保险；E2E 清单可快速回归 |
@@ -455,7 +547,7 @@ CLAUDE_CODE_SUBAGENT_MODEL     = <roles.subagent 所指模型的别名>
 | M1 | 配置中心 + 网关骨架（health、令牌、非流式路由、别名生成） | AC1/AC2/AC3/AC5/AC6 通过 |
 | M2 | SSE 流式 + 家族兜底 + 未知模型策略 + 请求日志 | AC4/AC7 通过 |
 | M3 | 接管 / 还原（含备份与还原清单、夹具测试） | AC8 通过 |
-| M4 | UI 五页 + provider 模板 + 测试连接 | 手工可用，无阻塞缺陷 |
+| M4 | UI 五页 + 厂家预设 + 测试连接 + 一键获取模型 | 无阻塞缺陷；AC10/AC11/AC12 通过（预设 baseUrl 逐个实测并标注 `verifiedAt`） |
 | M5 | 子 Agent 管理（新建 / 模型三选一 / 还原） | 夹具测试通过 |
 | M6 | 打包、托盘、开机自启、README、E2E | AC9 通过并交付安装包 |
 
@@ -470,3 +562,6 @@ CLAUDE_CODE_SUBAGENT_MODEL     = <roles.subagent 所指模型的别名>
 8. **别名表覆盖全部已配置模型**，而不是只覆盖被角色引用的模型。理由：否则 `GET /v1/models` 列出的别名与实际可路由集合不一致；副作用（可手打任意已配置模型的别名）是正面能力。
 9. **`FABLE` 家族保守处理**：写入 `ANTHROPIC_DEFAULT_FABLE_MODEL` 并纳入 main 家族兜底，而不是像 `*_MODEL_NAME` 那样不管或直接删除。理由：它出现在用户当前可用的配置里，很可能是真实家族槽位；语义核实前"写入 + 兜底"风险最低。
 10. **未绑定槽位的键不写入**：`roles.*` 为 `null` 时不写对应 env 键。这样"半配置"状态不会把 Claude Code 指向一个无法路由的别名。
+11. **预设是数据不是代码**：内置 `presets.json` + 用户 `presets.user.json` 覆盖。否决把厂商 URL 硬编码进代码——厂商改 URL 时不该以"重新发版"为修复前提（cc-switch [#6566](https://github.com/farion1231/cc-switch/issues/6566) 正是预设与实际不符的代价）。
+12. **模型列表拉取用多候选探测 + 失败三出路**，而不是单一固定路径。理由：Anthropic 兼容（`{base}/v1/models`）与 OpenAI 兼容（站点根 `/v1/models`）两种约定并存，且部分厂商根本不提供该接口；静默失败会让用户完全无从下手。
+13. **`contextWindow` / `maxTokens` 只作展示**，网关不依赖。避免厂商未在列表接口返回这些字段时，产生"必须手填才能用"的假门槛。
