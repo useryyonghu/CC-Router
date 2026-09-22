@@ -1575,7 +1575,9 @@ pub enum MatchedBy {
     Fallback,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 必须派生 `Hash`：`RouteTable::role_aliases` 是 `HashMap<Role, String>`，HashMap 的 key
+/// 需要 `Hash + Eq`。少了 `Hash` 会直接编译失败（E0277）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Role {
     Main,
     Fast,
@@ -1618,12 +1620,26 @@ struct Entry {
     context_1m: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RouteTable {
     aliases: HashMap<String, Entry>,
     role_aliases: HashMap<Role, String>,
     default_entry: Option<Entry>,
     policy: UnknownModelPolicy,
+}
+
+/// 手写 `Default`，不能用 `#[derive(Default)]`：`UnknownModelPolicy`（定义在 `config/mod.rs`，
+/// 不在本任务的文件范围内）没有实现 `Default`，派生会失败（E0277/E0119）。
+/// 空表上两种策略的行为完全一致（都得到 `UnknownModel`），所以这里取哪个值不可观测。
+impl Default for RouteTable {
+    fn default() -> Self {
+        RouteTable {
+            aliases: HashMap::new(),
+            role_aliases: HashMap::new(),
+            default_entry: None,
+            policy: UnknownModelPolicy::Error,
+        }
+    }
 }
 
 impl RouteTable {
@@ -1988,7 +2004,7 @@ pub mod resolve;
 - [ ] **Step 3: 运行测试**
 
 Run: `cargo test --manifest-path src-tauri/Cargo.toml routing::resolve`
-Expected: `test result: ok.`，11 个测试通过。
+Expected: `test result: ok.`，12 个测试通过（本任务新增 12 个；此前全库 26 个，合计 38 个）。
 
 - [ ] **Step 4: Commit**
 
