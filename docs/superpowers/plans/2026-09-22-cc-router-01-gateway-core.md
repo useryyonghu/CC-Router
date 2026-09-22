@@ -706,6 +706,20 @@ impl ConfigError {
     }
 }
 
+/// api_key 必须能作为 HTTP 请求头的值发送：非空、无首尾空白、且字节只允许 tab 与 0x20..=0x7E。
+/// 这里只在**本地**判定字节范围，而不调用 `HeaderValue::from_str`，以免让 `config` 依赖 HTTP 层。
+///
+/// 注意方向性：本谓词接受的范围是 `HeaderValue::from_str` 的**严格子集**
+/// （`from_str` 还接受 0x80..=0xFF 的 obs-text），所以"通过校验 ⇒ 一定能构造出 HeaderValue"
+/// 这个保证无条件成立；代价是像 `sk-密钥` 这种含非 ASCII 的 key 也会被拒——这是刻意的卫生规则，
+/// 不是一个漏洞。加这条校验的原因：`build_headers` 里对非法 key 会静默降级成**空凭据**，
+/// 于是一个坏 key 会表现为一个无法与"厂商挂了"区分的 401。
+fn valid_api_key(s: &str) -> bool {
+    !s.trim().is_empty()
+        && s == s.trim()
+        && s.bytes().all(|b| b == b'\t' || (0x20..=0x7e).contains(&b))
+}
+
 fn valid_provider_id(s: &str) -> bool {
     let bytes = s.as_bytes();
     if bytes.is_empty() || bytes.len() > 32 {
@@ -762,6 +776,12 @@ pub fn validate(cfg: &Config) -> Result<(), Vec<ConfigError>> {
             if !(mu.starts_with("http://") || mu.starts_with("https://")) {
                 errs.push(ConfigError::new(pf("modelsUrl"), "只能是完整 http(s):// URL 或 null"));
             }
+        }
+        if !valid_api_key(&p.api_key) {
+            errs.push(ConfigError::new(
+                pf("apiKey"),
+                "密钥不能为空，不能含首尾空白，且只能包含可打印 ASCII 字符（否则无法作为 HTTP 请求头发送）",
+            ));
         }
         let mut model_ids: HashSet<&str> = HashSet::new();
         for (mi, m) in p.models.iter().enumerate() {
@@ -999,13 +1019,45 @@ mod tests {
         let errs = validate(&cfg).unwrap_err();
         assert!(errs.iter().any(|e| e.field == "gateway.port"));
     }
+
+    /// 空 / 纯空白 key 会在 build_headers 里静默降级成空凭据，表现为一个无法定位的 401。
+    #[test]
+    fn rejects_empty_or_whitespace_only_api_key() {
+        for bad in ["", "   ", "\t"] {
+            let mut cfg = base_cfg();
+            cfg.providers[0].api_key = bad.to_string();
+            let errs = validate(&cfg).unwrap_err();
+            assert!(
+                errs.iter().any(|e| e.field == "providers[0].apiKey"),
+                "api_key {bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// 含非 ASCII 的 key 无法作为 HTTP 请求头值发送。
+    #[test]
+    fn rejects_api_key_with_non_ascii_characters() {
+        let mut cfg = base_cfg();
+        cfg.providers[0].api_key = "sk-密钥".to_string();
+        let errs = validate(&cfg).unwrap_err();
+        assert!(errs.iter().any(|e| e.field == "providers[0].apiKey"));
+    }
+
+    /// 首尾空白几乎总是粘贴错误，且会导致鉴权头与服务端预期不一致。
+    #[test]
+    fn rejects_api_key_with_surrounding_whitespace() {
+        let mut cfg = base_cfg();
+        cfg.providers[0].api_key = " sk-real ".to_string();
+        let errs = validate(&cfg).unwrap_err();
+        assert!(errs.iter().any(|e| e.field == "providers[0].apiKey"));
+    }
 }
 ```
 
 - [ ] **Step 5: 运行校验测试，确认全部通过**
 
 Run: `cargo test --manifest-path src-tauri/Cargo.toml config::validate`
-Expected: `test result: ok.` 全部 10 个测试通过。
+Expected: `test result: ok.` 全部 13 个测试通过。
 
 - [ ] **Step 6: 写 `src-tauri/src/config/store.rs`（含测试）**
 
@@ -1295,7 +1347,7 @@ pub fn run() {
 - [ ] **Step 8: 运行本任务全部测试**
 
 Run: `cargo test --manifest-path src-tauri/Cargo.toml`
-Expected: `test result: ok.`，共 19 个测试通过（10 校验 + 9 store），0 failed。
+Expected: `test result: ok.`，共 22 个测试通过（13 校验 + 9 store），0 failed。
 
 - [ ] **Step 9: Commit**
 
