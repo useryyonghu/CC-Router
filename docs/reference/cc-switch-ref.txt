@@ -1,0 +1,6 @@
+{
+	"type": "gh",
+	"name": "farion1231/cc-switch",
+	"version": null,
+	"links": {}
+}
