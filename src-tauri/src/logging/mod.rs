@@ -1,6 +1,8 @@
 use crate::routing::resolve::ResolvedTarget;
 use std::collections::VecDeque;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -73,19 +75,49 @@ impl LogEntry {
 pub struct RequestLog {
     capacity: usize,
     entries: Arc<Mutex<VecDeque<LogEntry>>>,
+    tx: broadcast::Sender<LogEntry>,
+    file: Arc<Mutex<Option<std::path::PathBuf>>>,
 }
 
 impl RequestLog {
     pub fn new(capacity: usize) -> Self {
-        RequestLog { capacity, entries: Arc::new(Mutex::new(VecDeque::with_capacity(capacity))) }
+        let (tx, _rx) = broadcast::channel(256);
+        RequestLog {
+            capacity,
+            entries: Arc::new(Mutex::new(VecDeque::with_capacity(capacity))),
+            tx,
+            file: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn push(&self, entry: LogEntry) {
-        let mut buf = self.entries.lock().expect("log lock poisoned");
-        if buf.len() == self.capacity {
-            buf.pop_front();
+        {
+            let mut buf = self.entries.lock().expect("log lock poisoned");
+            if buf.len() == self.capacity {
+                buf.pop_front();
+            }
+            buf.push_back(entry.clone());
         }
-        buf.push_back(entry);
+        let _ = self.tx.send(entry.clone());
+        let path = self.file.lock().expect("log file lock poisoned").clone();
+        if let Some(path) = path {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(line) = serde_json::to_string(&entry) {
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                    let _ = writeln!(f, "{line}");
+                }
+            }
+        }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<LogEntry> {
+        self.tx.subscribe()
+    }
+
+    pub fn set_file_logging(&self, enabled: bool, path: std::path::PathBuf) {
+        *self.file.lock().expect("log file lock poisoned") = if enabled { Some(path) } else { None };
     }
 
     pub fn recent(&self, limit: usize) -> Vec<LogEntry> {

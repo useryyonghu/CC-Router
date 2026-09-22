@@ -1,10 +1,9 @@
 //! 共享集成测试脚手架（Task 6 建立，Task 7/8 复用）。
 //!
-//! 这里的公开面是本任务**有意**超出当前用例需要的：`MockUpstream::start_sse`、
-//! `RecordedRequest::query`、`MockUpstream::port` 等都是给流式（Task 7）与
-//! 状态/日志（Task 8）测试预留的接口。它们在本任务里没有调用点，
-//! 因此整个模块统一放行 dead_code，避免引入新告警。
-#![allow(dead_code)]
+//! 每个集成测试文件都是一个独立 crate，都会编译本模块的一份副本，因此某个
+//! 成员"在某个测试二进制里没被用到"是常态。这里**不再**使用整模块的
+//! `#![allow(dead_code)]`（那会掩盖真正的死代码）：真正无人使用的成员已经删除，
+//! 跨二进制使用不均衡的成员各自带一条有针对性的 `#[allow(dead_code)]` 与理由。
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -20,6 +19,9 @@ use tokio::sync::oneshot;
 
 pub type Recorded = Arc<Mutex<Vec<RecordedRequest>>>;
 
+// 字段按测试二进制不同而被读取（`query` 只在 gateway_stream 用，`method`/`headers`
+// 只在 gateway_nonstream 用）；每个集成测试 crate 独立编译本模块，故无法逐字段满足。
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RecordedRequest {
     pub method: String,
@@ -30,6 +32,8 @@ pub struct RecordedRequest {
 }
 
 impl RecordedRequest {
+    // 只在 gateway_nonstream 使用，另外两个测试二进制用不到。
+    #[allow(dead_code)]
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -40,7 +44,8 @@ impl RecordedRequest {
 
 pub struct MockUpstream {
     pub base_url: String,
-    pub port: u16,
+    // 只被 `requests()` 读取，而 request_log 不调用 `requests()`。
+    #[allow(dead_code)]
     pub recorded: Recorded,
     shutdown: Option<oneshot::Sender<()>>,
     join: tokio::task::JoinHandle<()>,
@@ -64,6 +69,8 @@ impl MockUpstream {
     }
 
     /// 非流式：固定返回原始字节与 content-type（用于 HTML 错误页等）。
+    // 只在 gateway_nonstream 使用。
+    #[allow(dead_code)]
     pub async fn start_raw(status: u16, content_type: &'static str, body: &'static [u8]) -> Self {
         MockUpstream::start(move || async move {
             Response::builder()
@@ -76,6 +83,8 @@ impl MockUpstream {
     }
 
     /// SSE：按 `chunks` 逐块发送，块间 sleep `gap`，首块前额外 sleep `first_delay`。
+    // 只在 gateway_stream 使用。
+    #[allow(dead_code)]
     pub async fn start_sse(
         chunks: Vec<String>,
         gap: std::time::Duration,
@@ -146,13 +155,14 @@ impl MockUpstream {
         });
         MockUpstream {
             base_url: format!("http://127.0.0.1:{port}"),
-            port,
             recorded,
             shutdown: Some(tx),
             join,
         }
     }
 
+    // request_log 不读取上游收到的请求。
+    #[allow(dead_code)]
     pub fn requests(&self) -> Vec<RecordedRequest> {
         self.recorded.lock().unwrap().clone()
     }
@@ -174,6 +184,8 @@ fn full(bytes: Vec<u8>) -> BoxedMockBody {
         .boxed()
 }
 
+// 只被 `start_sse` 调用，因此未使用 SSE 的测试二进制里它是死代码。
+#[allow(dead_code)]
 fn async_stream_like(
     chunks: Vec<String>,
     gap: std::time::Duration,
@@ -260,6 +272,8 @@ pub fn test_config(upstream_base_url: &str, port: u16) -> cc_router::config::Con
     }
 }
 
+// gateway_stream 直接构造 JSON，不需要这个固定响应体。
+#[allow(dead_code)]
 pub fn ok_message_body(model: &str) -> serde_json::Value {
     serde_json::json!({
         "id": "msg_test",

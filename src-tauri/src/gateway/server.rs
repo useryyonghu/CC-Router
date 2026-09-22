@@ -149,6 +149,16 @@ pub async fn handle(req: Request<Incoming>, state: GatewayState, _peer: SocketAd
         );
     }
 
+    if path == "/v1/models" && req.method() == hyper::Method::GET {
+        let cfg = state.config.read().expect("config lock poisoned");
+        let payload = models_payload(&cfg);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(body_full(serde_json::to_vec(&payload).unwrap()))
+            .expect("static response is valid");
+    }
+
     let is_messages = path == "/v1/messages";
     let is_count = path == "/v1/messages/count_tokens";
 
@@ -239,27 +249,25 @@ pub async fn handle(req: Request<Incoming>, state: GatewayState, _peer: SocketAd
         Ok(r) => r,
         Err(e) => {
             state.requests_served.fetch_add(1, Ordering::Relaxed);
+            // 日志的 error 与响应体必须同源：两者都要点名 provider 与别名（Task 8 用例断言）。
+            let message = format!(
+                "上游请求失败（provider={} 别名={} url={}）: {}",
+                resolved.provider_id, resolved.alias, url, e
+            );
             state.log.push(crate::logging::LogEntry::error(
                 &method,
                 &path,
                 &requested_model,
                 &resolved,
                 started.elapsed().as_millis() as u64,
-                &e.to_string(),
+                &message,
             ));
             let (status, kind) = if e.is_timeout() {
                 (StatusCode::GATEWAY_TIMEOUT, ErrorKind::Api)
             } else {
                 (StatusCode::BAD_GATEWAY, ErrorKind::Api)
             };
-            return anthropic_error(
-                status,
-                kind,
-                format!(
-                    "上游请求失败（provider={} 别名={} url={}）: {}",
-                    resolved.provider_id, resolved.alias, url, e
-                ),
-            );
+            return anthropic_error(status, kind, message);
         }
     };
 
@@ -330,6 +338,45 @@ where
             }
         },
     )
+}
+
+/// 合成 Anthropic 列表格式：id = 全部模型别名 ∪ extraRoutes 别名。
+pub fn models_payload(cfg: &Config) -> serde_json::Value {
+    use serde_json::json;
+    let mut data = Vec::new();
+    for p in &cfg.providers {
+        for m in &p.models {
+            data.push(json!({
+                "type": "model",
+                "id": m.alias,
+                "display_name": format!("{} / {}", p.name, m.name),
+            }));
+        }
+    }
+    for r in &cfg.extra_routes {
+        data.push(json!({
+            "type": "model",
+            "id": r.alias,
+            "display_name": format!("{} / {} (extra route)", r.provider_id, r.model_id),
+        }));
+    }
+    let first_id = cfg
+        .providers
+        .iter()
+        .find_map(|p| p.models.first())
+        .map(|m| m.alias.clone());
+    let last_id = cfg
+        .providers
+        .iter()
+        .rev()
+        .find_map(|p| p.models.last())
+        .map(|m| m.alias.clone());
+    json!({
+        "data": data,
+        "has_more": false,
+        "first_id": first_id,
+        "last_id": last_id,
+    })
 }
 
 fn health(state: &GatewayState) -> Response<BoxedBody> {
