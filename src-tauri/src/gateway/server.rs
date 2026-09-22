@@ -4,6 +4,7 @@ use crate::gateway::error::{anthropic_error, ErrorKind};
 use crate::gateway::rewrite::{build_headers, rewrite_body, upstream_url, RewriteError};
 use crate::routing::resolve::{ResolveError, RouteTable};
 use crate::error::{Error, Result};
+use futures_util::StreamExt;
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -158,7 +159,6 @@ pub async fn handle(req: Request<Incoming>, state: GatewayState, _peer: SocketAd
         let cfg = state.config.read().expect("config lock poisoned");
         (cfg.gateway.max_request_body_bytes, cfg.gateway.idle_timeout_ms)
     };
-    let _ = idle_timeout_ms; // Task 7 的流式分支使用它
 
     // 用 Limited 包住 body，防止超大请求体打爆内存（spec §6.3）。
     let body_bytes = match Limited::new(req.into_body(), max_body).collect().await {
@@ -291,7 +291,8 @@ pub async fn handle(req: Request<Incoming>, state: GatewayState, _peer: SocketAd
     ));
 
     let body: BoxedBody = if is_sse {
-        body_stream(upstream.bytes_stream())
+        let idle = std::time::Duration::from_millis(idle_timeout_ms);
+        body_stream(idle_guarded(upstream.bytes_stream(), idle))
     } else {
         match upstream.bytes().await {
             Ok(b) => body_full(b),
@@ -306,6 +307,29 @@ pub async fn handle(req: Request<Incoming>, state: GatewayState, _peer: SocketAd
     };
 
     resp.body(body).expect("upstream headers are valid")
+}
+
+/// 空闲超时保护：两个块之间超过 `idle` 未到达则结束流（不 panic，已转发的块保持完整）。
+fn idle_guarded<S, E>(
+    stream: S,
+    idle: std::time::Duration,
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    futures_util::stream::unfold(
+        (Box::pin(stream), idle),
+        |(mut s, idle)| async move {
+            match tokio::time::timeout(idle, s.next()).await {
+                Ok(Some(item)) => Some((item, (s, idle))),
+                // 超时或流结束：结束下游流。客户端断开时 hyper 会 drop 本 future，
+                // 从而 drop 掉上游 reqwest 流，上游请求随之取消。
+                Ok(None) => None,
+                Err(_elapsed) => None,
+            }
+        },
+    )
 }
 
 fn health(state: &GatewayState) -> Response<BoxedBody> {
