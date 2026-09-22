@@ -3887,13 +3887,21 @@ where
 - [ ] **Step 4: 重跑流式测试**
 
 Run: `cargo test --manifest-path src-tauri/Cargo.toml --test gateway_stream`
-Expected: `test result: ok.`，8 个测试全部通过（全库合计 75 = 52 lib + 15 `gateway_nonstream` + 8 `gateway_stream`）。
+Expected: `test result: ok.`，**10 个测试全部通过**（全库合计 **77** = 52 lib + 15 `gateway_nonstream` + 10 `gateway_stream`）。
 
-> **已知覆盖缺口（评审已记录，交给 Task 8 或后续补齐）**：这 8 个用例里没有一个会触发空闲超时
-> （`test_config` 的 `idle_timeout_ms = 300_000`），所以 `idle_guarded` 里 `Err(_elapsed)` 那条分支
-> **没有已提交的测试pin**。实现时用临时用例验证过（`idle = 300ms` + 上游块间隔 2s → 下游在 306.78ms
-> 干净收流且未送达任何块；把 `server.rs` 回退到 Task 6 版本后同一条流会跑满 10.04s），但临时用例已删除。
-> 另外：空闲超时导致的下游截断与"正常结束"在下游不可区分（不发错误帧），这是 brief 指定的行为。
+> **评审修复轮 1 补的 2 个用例**（首轮实现 8 个；评审把下面两点判为 Important 计划内覆盖缺口，且在
+> Task 7 内关闭，未推迟）：
+> - `idle_timeout_ends_stalled_stream` —— `idle_timeout_ms = 300`、上游 `first_delay = 0` / `gap = 2000ms`：
+>   断言 chunk 0 **在**、chunk 1 **不在**、下游读取**正常收流结束**、且耗时远小于 2000ms 的间隔。
+>   这是本任务唯一的行为改动（空闲超时）的**唯一**已提交证据——此前 8 个用例全都用
+>   `idle_timeout_ms = 300_000`，把 `idle_guarded` 整个删掉也全绿。
+> - `client_disconnect_cancels_upstream` —— 用测试内自建的裸 `TcpListener` 作上游（共享的
+>   `tests/support/mod.rs` 因此不需要改动），在客户端断开后断言上游观察到 EOF/取消，而不只是断言
+>   网关还活着（后者无法区分"真取消"与"起了后台任务继续 drain"）。
+>
+> 另记：空闲超时导致的下游截断与"正常结束"在下游不可区分（不发错误帧），这是 brief 指定的行为；
+> `idle_timeout_ms = 0` 会让每条流被立刻截断（`timeout(0, …)`），其语义未定义——留给 config 校验或
+> 终审决定。
 
 - [ ] **Step 5: 重跑全部测试确保无回归**
 
