@@ -6,6 +6,8 @@
 //! 本模块不依赖 Tauri（硬约束）；`add_model` 的别名生成复用 `routing::alias`，
 //! `test_connection` 的鉴权头复用 `gateway::rewrite`（both 同发两种头）——避免第二套实现漂移。
 
+pub mod fetch;
+
 #[cfg(test)]
 mod mock;
 
