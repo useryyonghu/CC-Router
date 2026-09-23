@@ -599,7 +599,7 @@ pub async fn models_fetch(
     provider_id: String,
     models_url: Option<String>,
 ) -> Result<FetchOutcomeDto, String> {
-    let mut cfg = state.store.snapshot();
+    let cfg = state.store.snapshot();
     let mut provider = cfg
         .providers
         .iter()
@@ -625,18 +625,37 @@ pub async fn models_fetch(
 
     // spec §5.7：结果写入 modelsFetch —— UI 显示"上次拉取：时间 / 来源 URL / 数量"，
     // 且 `candidate_urls` 下次会优先试这个地址。
-    if let Some(slot) = cfg.providers.iter_mut().find(|p| p.id == provider_id) {
-        slot.models_fetch = Some(crate::config::ModelsFetch {
+    if let Err(e) = record_models_fetch(
+        &state.store,
+        &provider_id,
+        crate::config::ModelsFetch {
             last_at: chrono::Local::now().to_rfc3339(),
             last_url: outcome.used_url.clone(),
             count: outcome.models.len(),
-        });
-    }
-    if let Err(e) = state.store.save(cfg) {
+        },
+    ) {
         // 拉取本身已经成功：不能因为"记不上时间戳"就让 UI 以为失败。
         eprintln!("[cc-router] 记录 modelsFetch 失败（本次拉取结果仍然有效）: {e}");
     }
     Ok(outcome)
+}
+
+/// 记录一次成功的拉取（spec §5.7）。
+///
+/// **必须重新取快照再写**：一次拉取要按候选逐个 await（每个 15s 超时），这期间用户完全可能
+/// 在界面上加了一个模型或改了密钥。若把"拉取开始前那份旧快照"整份 `save` 回去，那些并发
+/// 改动会被静默覆盖 —— 本命令只该改 `modelsFetch` 这一个字段。
+pub fn record_models_fetch(
+    store: &ConfigStore,
+    provider_id: &str,
+    fetched: crate::config::ModelsFetch,
+) -> Result<(), String> {
+    let mut latest = store.snapshot();
+    match latest.providers.iter_mut().find(|p| p.id == provider_id) {
+        Some(slot) => slot.models_fetch = Some(fetched),
+        None => return Err(format!("provider '{provider_id}' 不存在")),
+    }
+    store.save(latest).map_err(|e| e.to_string())
 }
 
 /// 批量加入模型（逐条走 `provider::add_model`，最后一次落盘）；返回新别名。
@@ -688,7 +707,20 @@ pub async fn gateway_restart(state: State<'_, Arc<AppState>>) -> Result<u16, Str
 /// 网关与配置共享同一个 `Arc<RwLock<Config>>`，所以 `save` 之后新令牌立即生效，无需重启网关。
 #[tauri::command]
 pub fn token_regenerate(state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    let mut cfg = state.store.snapshot();
+    let (settings_path, backups_dir) = state.claude_paths();
+    token_regenerate_impl(&state.store, &settings_path, &backups_dir)
+}
+
+/// [`token_regenerate`] 的实现体（spec §9.2）。
+///
+/// 与命令外壳分离是为了能用普通 `cargo test` 覆盖"落盘失败时把 settings.json 回滚成旧令牌"
+/// 这条不变量 —— 它一旦失效，Claude Code 会拿着新令牌打一个只认旧令牌的网关，每个请求都 401。
+pub fn token_regenerate_impl(
+    store: &ConfigStore,
+    settings_path: &Path,
+    backups_dir: &Path,
+) -> Result<String, String> {
+    let mut cfg = store.snapshot();
     let token = crate::config::generate_local_token();
     cfg.gateway.local_token = token.clone();
 
@@ -698,24 +730,34 @@ pub fn token_regenerate(state: State<'_, Arc<AppState>>) -> Result<String, Strin
         })?;
         let manifest: claude_settings::TakeoverManifest = serde_json::from_value(value)
             .map_err(|e| format!("接管清单已损坏（{e}）：请先「一键还原」再重新接管"))?;
-        let (settings_path, backups_dir) = state.claude_paths();
-        Some((manifest, settings_path, backups_dir))
+        Some(manifest)
     } else {
         None
     };
 
-    if let Some((manifest, settings_path, backups_dir)) = refresh.as_ref() {
-        // 先改文件再落配置：`refresh_takeover` 是"先校验后原子写"，失败时两边都没变；
+    if let Some(manifest) = refresh.as_ref() {
+        // 先改文件再落配置：`refresh_takeover_token` 是"先校验后原子写"，失败时两边都没变；
         // 而落配置失败时用**内存里的旧配置**把文件回滚，绝不留下
         // "config.json 是新令牌、Claude Code 拿旧令牌" 的错配（那会让每个请求都 401）。
         refresh_takeover_token(&cfg, manifest, settings_path, backups_dir)?;
     }
-    if let Err(e) = state.store.save(cfg) {
-        if let Some((manifest, settings_path, backups_dir)) = refresh.as_ref() {
-            let previous = state.store.snapshot();
-            let _ = refresh_takeover_token(&previous, manifest, settings_path, backups_dir);
+    if let Err(e) = store.save(cfg) {
+        if let Some(manifest) = refresh.as_ref() {
+            let previous = store.snapshot();
+            // 回滚**可能失败**。只写"已回滚"就是在撒谎：用户会照着假消息去查错的方向，
+            // 而实际上两边令牌不一致、必须手工修。所以两种结果分开如实报告。
+            return Err(
+                match refresh_takeover_token(&previous, manifest, settings_path, backups_dir) {
+                    Ok(()) => format!("保存新令牌失败（已把 Claude Code 配置回滚为旧令牌）：{e}"),
+                    Err(rb) => format!(
+                        "保存新令牌失败（{e}），且回滚 Claude Code 配置也失败（{rb}）：\
+                         现在 config.json 与 settings.json 的令牌不一致，请再点一次「重新生成令牌」\
+                         或用「一键还原」把两边改回同一个值"
+                    ),
+                },
+            );
         }
-        return Err(format!("保存新令牌失败（已把 Claude Code 配置回滚为旧令牌）：{e}"));
+        return Err(format!("保存新令牌失败：{e}"));
     }
     Ok(token)
 }
@@ -753,12 +795,16 @@ fn refresh_takeover_token(
     let mut text = serde_json::to_string_pretty(&doc).map_err(|e| format!("序列化失败: {e}"))?;
     text.push('\n');
     let after = text.into_bytes();
-    crate::claude::atomic_write_bytes(settings_path, &after).map_err(|e| e.to_string())?;
-    if !manifest.post_bytes_file.is_empty() {
-        crate::claude::atomic_write_bytes(&backups_dir.join(&manifest.post_bytes_file), &after)
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    // 顺序的**唯一实现**在 claude::settings：post 快照必须先于 settings.json（spec §7.2）。
+    // 这里以前是反的 —— post 写失败会留下"settings.json 已是新令牌、config.json 还是旧令牌"，
+    // 每个 Claude Code 请求都 401，精确还原也会静默退化成合并式回放。
+    claude_settings::write_post_then_target(
+        settings_path,
+        &after,
+        backups_dir,
+        &manifest.post_bytes_file,
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[derive(serde::Serialize)]
@@ -1071,5 +1117,141 @@ mod tests {
             "开关关闭时不得启用 sink"
         );
         assert!(!logs2.exists(), "开关关闭时不得创建日志目录/文件");
+    }
+
+    /// IMPORTANT：post 快照必须**先于** `settings.json` 落盘（spec §7.2 关键设计 7）。
+    ///
+    /// post 既是"settings.json 里现在是我们写的内容"的凭据，也是 spec §7.3 Verbatim 还原的
+    /// 判据。顺序反过来的话，post 写失败时 settings.json 已经带着新令牌、而 config 还是旧令牌
+    /// —— 每个 Claude Code 请求都 401，精确还原还会静默退化成合并式回放。
+    /// 这里用"备份目录的位置被普通文件占住"让 post 写入必然失败。
+    #[test]
+    fn refresh_takeover_token_writes_post_snapshot_before_settings_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let backups = dir.path().join("backups");
+        std::fs::write(&settings_path, br#"{"env":{"KEEP_ME":"1"}}"#).unwrap();
+
+        let c = cfg();
+        let manifest =
+            claude_settings::apply_takeover_at(&c, &settings_path, &backups, "STAMP").unwrap();
+        let taken_over = std::fs::read(&settings_path).unwrap();
+        assert!(String::from_utf8_lossy(&taken_over).contains(&c.gateway.local_token));
+
+        std::fs::remove_dir_all(&backups).unwrap();
+        std::fs::write(&backups, "I am a file, not a directory").unwrap();
+
+        let mut next = c.clone();
+        next.gateway.local_token = "sk-ccr-new-token-must-not-land".into();
+        let err = refresh_takeover_token(&next, &manifest, &settings_path, &backups).unwrap_err();
+        // 失败点就是 post 快照那一侧（报错里出现的是备份目录）
+        assert!(err.contains("backups"), "错误应当点名失败的写入目标: {err}");
+        assert_eq!(
+            std::fs::read(&settings_path).unwrap(),
+            taken_over,
+            "post 快照写失败时 settings.json 必须一个字节都没变（否则新旧令牌错配 → 全部 401）"
+        );
+    }
+
+    /// IMPORTANT：`save` 失败时把 settings.json 回滚成旧令牌，并且**只陈述实际发生的事**。
+    ///
+    /// 旧实现在回滚失败时仍然返回"已把 Claude Code 配置回滚为旧令牌" —— 那是一句谎话，
+    /// 用户会照着它去查错方向，而真实状态是两边令牌不一致、必须手工修。
+    #[test]
+    fn token_regenerate_rolls_settings_back_and_reports_the_truth() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let backups = dir.path().join("backups");
+        let config_path = dir.path().join("config.json");
+        std::fs::write(&settings_path, br#"{"env":{"KEEP_ME":"1"}}"#).unwrap();
+
+        let store = ConfigStore::load(&config_path).unwrap();
+        let mut c = cfg();
+        let manifest =
+            claude_settings::apply_takeover_at(&c, &settings_path, &backups, "STAMP").unwrap();
+        c.takeover = TakeoverState {
+            enabled: true,
+            applied_at: Some(manifest.applied_at.clone()),
+            backup_file: Some(manifest.pre_bytes_file.clone()),
+            manifest: Some(serde_json::to_value(&manifest).unwrap()),
+            ..TakeoverState::default()
+        };
+        let old_token = c.gateway.local_token.clone();
+        store.save(c).unwrap();
+        let before = std::fs::read(&settings_path).unwrap();
+
+        // 让 `save` 必然失败，但**内存配置保持合法**：把 config.json 的位置换成目录，
+        // 于是 atomic_write_json 的 rename 失败（IO 错误）。这样回滚用的 previous 快照
+        // 就是真实有效的旧配置，与线上场景一致。
+        std::fs::remove_file(&config_path).unwrap();
+        std::fs::create_dir(&config_path).unwrap();
+
+        let err = token_regenerate_impl(&store, &settings_path, &backups).unwrap_err();
+        assert!(
+            err.contains("已把 Claude Code 配置回滚为旧令牌"),
+            "回滚成功时消息应当这么说（且这是真的）: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&settings_path).unwrap(),
+            before,
+            "回滚必须把 settings.json 逐字节写回旧令牌"
+        );
+        assert!(String::from_utf8_lossy(&before).contains(&old_token));
+        assert_eq!(store.snapshot().gateway.local_token, old_token, "内存配置也没被改掉");
+    }
+
+    /// MINOR：拉取模型列表可能耗时十几秒（每个候选 15s 超时），这期间用户的并发改动
+    /// （例如新增一个 provider / 模型）**不能**被"拉取前那份旧快照"整份覆盖回去。
+    /// 本命令只该改 `modelsFetch` 一个字段。
+    #[test]
+    fn recording_models_fetch_merges_instead_of_clobbering_concurrent_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::load(dir.path().join("config.json")).unwrap();
+        store.save(cfg()).unwrap();
+
+        // 拉取开始时记下的形态（此刻只有 2 个 provider）—— 旧实现就是把它 save 回去
+        let stale = store.snapshot();
+        assert_eq!(stale.providers.len(), 2);
+
+        // 拉取期间用户加了第三个 provider
+        let mut concurrent = store.snapshot();
+        concurrent.providers.push(provider(
+            "moonshot",
+            "https://api.moonshot.cn/anthropic",
+            &[("k2", "ccr-moonshot-k2")],
+        ));
+        store.save(concurrent).unwrap();
+
+        record_models_fetch(
+            &store,
+            "kimi",
+            ModelsFetch {
+                last_at: "2026-09-22T10:00:00+08:00".into(),
+                last_url: "https://api.moonshot.cn/models".into(),
+                count: 7,
+            },
+        )
+        .unwrap();
+
+        let after = store.snapshot();
+        assert_eq!(after.providers.len(), 3, "并发新增的 provider 不得被旧快照覆盖掉");
+        assert!(
+            after.providers.iter().any(|p| p.id == "moonshot"),
+            "并发新增的 provider 必须还在: {:?}",
+            after.providers.iter().map(|p| &p.id).collect::<Vec<_>>()
+        );
+        let fetched = after
+            .providers
+            .iter()
+            .find(|p| p.id == "kimi")
+            .and_then(|p| p.models_fetch.clone())
+            .expect("modelsFetch 必须被记录");
+        assert_eq!(fetched.count, 7);
+        assert_eq!(fetched.last_url, "https://api.moonshot.cn/models");
+        assert_eq!(
+            crate::config::store::load_from(store.path()).unwrap(),
+            after,
+            "磁盘与内存必须一致"
+        );
     }
 }

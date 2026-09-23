@@ -262,11 +262,7 @@ pub fn apply_takeover_at(
     if file_existed {
         write_if_absent(&backups_dir.join(&pre_bytes_file), &before)?;
     }
-    // **post 必须先于 settings.json 落盘**：post 既是"我们写出的字节"的凭据，也是还原判据。
-    // 若反过来，settings.json 写成功后 post 写失败，就会留下"文件已被接管、却没有任何还原
-    // 依据"的状态 —— 清单要到本函数返回 Ok 之后才由上层落盘。post 总是覆盖。
-    atomic_write_bytes(&backups_dir.join(&post_bytes_file), &after)?;
-    atomic_write_bytes(settings_path, &after)?;
+    write_post_then_target(settings_path, &after, backups_dir, &post_bytes_file)?;
 
     Ok(TakeoverManifest {
         applied_at: chrono::Local::now().to_rfc3339(),
@@ -354,6 +350,28 @@ fn write_if_absent(path: &Path, bytes: &[u8]) -> Result<()> {
         return Ok(());
     }
     atomic_write_bytes(path, bytes)
+}
+
+/// 把"我们写出的字节"按**先 post 快照、后目标文件**的顺序落盘（spec §7.2 关键设计 7）。
+///
+/// post 快照既是"目标文件里现在是我们写的内容"的凭据，也是 spec §7.3 Verbatim 还原的判据。
+/// 顺序反过来的话，post 写失败会留下"目标文件已经改了、却没有对应凭据"的状态：
+/// 对 `settings.json` 就是 config 里还是旧令牌、Claude Code 已经拿到新令牌 —— 每个请求都 401，
+/// 而且精确还原静默退化成合并式回放。反方向的失败（post 写了、目标没写）只是多一份快照，无害。
+///
+/// **这是该顺序的唯一实现**：`apply_takeover_at` 与命令层的令牌刷新都走这里。
+/// 这个 bug 的成因就是同一段顺序被抄了两份、其中一份写反了。
+pub fn write_post_then_target(
+    target: &Path,
+    bytes: &[u8],
+    backups_dir: &Path,
+    post_bytes_file: &str,
+) -> Result<()> {
+    if !post_bytes_file.is_empty() {
+        // post 总是覆盖：它记录的是"我们刚写出的字节"，不是历史版本。
+        atomic_write_bytes(&backups_dir.join(post_bytes_file), bytes)?;
+    }
+    atomic_write_bytes(target, bytes)
 }
 
 /// 按清单把己方的键合并回当前内容：`existed=true` 写回原值，`existed=false` 删除；
