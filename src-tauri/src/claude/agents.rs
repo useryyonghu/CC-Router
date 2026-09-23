@@ -295,6 +295,31 @@ pub fn manifest_key(path: &Path) -> String {
     raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string()
 }
 
+/// 删除备份文件前的**目录守卫**（spec §9 的同一套思路）。
+///
+/// 界面会把备份文件路径回传上来，而这个路径直接进 `remove_file` —— 没有守卫的话，
+/// 一个被污染/错误的前端参数就能删掉任意文件。所以两侧都 canonicalize：
+/// 目标必须是 `backups/agents` **之内**的普通文件，目录本身也拒绝。
+/// 任一侧无法规范化（目录不存在、文件不存在）即 fail-closed。
+pub fn ensure_within_backups_dir(backups_agents_dir: &Path, target: &Path) -> Result<()> {
+    let root = backups_agents_dir
+        .canonicalize()
+        .map_err(|e| Error::io(backups_agents_dir.to_path_buf(), e))?;
+    let resolved = target
+        .canonicalize()
+        .map_err(|e| Error::io(target.to_path_buf(), e))?;
+    if resolved == root || !resolved.starts_with(&root) {
+        return Err(Error::Io {
+            path: target.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "拒绝操作备份目录之外的文件",
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// 批量还原（spec §8.3：一键还原要把清单里的每个子 Agent 文件都回放回去）。
 ///
 /// 返回 `(成功还原的路径, 失败描述)`。**不因为一个文件失败就提前中断**：否则排在后面的文件
@@ -766,6 +791,40 @@ mod tests {
         assert!(
             ensure_within_agents_dir(&agents, &link).is_err(),
             "指向目录外的符号链接必须被拒（canonicalize 后落在 agents 之外）"
+        );
+    }
+
+    /// 删除备份前的目录守卫：这是"界面回传路径 → `remove_file`"这条链上唯一的防线。
+    #[test]
+    fn backup_guard_allows_inside_and_rejects_everything_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let inside = agents.join("reviewer.md-29d8bf14ee6ea9ea.20260923T135817.bak");
+        std::fs::write(&inside, b"backup").unwrap();
+        let outside = dir.path().join("settings.json.pre.bak");
+        std::fs::write(&outside, b"secret").unwrap();
+
+        assert!(
+            ensure_within_backups_dir(&agents, &inside).is_ok(),
+            "备份目录之内的普通文件应当允许删除"
+        );
+        assert!(
+            ensure_within_backups_dir(&agents, &outside).is_err(),
+            "备份目录之外的文件必须被拒 —— 否则一个被污染的参数就能删掉任意文件"
+        );
+        assert!(
+            ensure_within_backups_dir(&agents, &agents).is_err(),
+            "目录自身必须被拒"
+        );
+        assert!(
+            ensure_within_backups_dir(&agents, &agents.join("不存在的.bak")).is_err(),
+            "不存在的路径必须 fail-closed"
+        );
+        assert!(
+            ensure_within_backups_dir(&agents, &inside.join("..").join("..").join("settings.json.pre.bak"))
+                .is_err(),
+            "`..` 逃逸必须被拒"
         );
     }
 }

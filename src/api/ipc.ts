@@ -547,6 +547,11 @@ export function agentBackupsList(): Promise<AgentBackupDto[]> {
   return call<AgentBackupDto[]>("agent_backups_list");
 }
 
+/** 删除一个子 Agent 备份文件（后端有目录守卫：只允许 `backups/agents/` 之内的文件）。 */
+export function agentBackupDelete(path: string): Promise<void> {
+  return call<void>("agent_backup_delete", { path });
+}
+
 export function settingsPaths(): Promise<SettingsPaths> {
   return call<SettingsPaths>("settings_paths");
 }

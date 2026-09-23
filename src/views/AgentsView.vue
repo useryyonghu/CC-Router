@@ -159,6 +159,28 @@ const KIND_META: Record<string, { text: string; type: "error" | "warning" | "def
   unknown: { text: "来源未知", type: "default" },
 };
 
+/** 删除一条备份（不可撤销，所以先确认；并如实说明代价）。 */
+async function removeBackup(row: AgentBackupDto): Promise<void> {
+  const go = await confirm({
+    title: "删除这个备份？",
+    content:
+      `将永久删除备份文件：${row.backupPath}\n\n` +
+      "删除备份不影响你当前的配置或子 Agent 文件；代价是这个文件将来需要「一键还原」时，" +
+      "少了一份可以逐字节回放的原文。此操作不可撤销。",
+    positiveText: "删除",
+    danger: true,
+  });
+  if (!go) return;
+  await run(
+    async () => {
+      await ipc.agentBackupDelete(row.backupPath);
+      await loadAgentBackups();
+    },
+    "备份已删除",
+    `rm-backup-${row.backupPath}`,
+  );
+}
+
 function formatBackupTime(iso: string | null): string {
   if (!iso) return "—";
   const parsed = new Date(iso);
@@ -225,6 +247,25 @@ const backupColumns = computed<DataTableColumns<AgentBackupDto>>(() => [
     key: "sizeBytes",
     width: 90,
     render: (row) => `${row.sizeBytes} B`,
+  },
+  {
+    title: "操作",
+    key: "actions",
+    width: 100,
+    // 固定在最右：这张表也宽于默认窗口，不固定则按钮够不到
+    fixed: "right",
+    render: (row) =>
+      h(
+        NButton,
+        {
+          size: "small",
+          type: "error",
+          quaternary: true,
+          loading: isBusy(`rm-backup-${row.backupPath}`),
+          onClick: () => void removeBackup(row),
+        },
+        { default: () => "删除" },
+      ),
   },
 ]);
 
@@ -537,7 +578,7 @@ const columns = computed<DataTableColumns<AgentInfo>>(() => [
         size="small"
         style="margin-top: 10px"
         :max-height="260"
-        :scroll-x="1150"
+        :scroll-x="1250"
         :locale="{ empty: '还没有子 Agent 备份（删除或改动子 Agent 时会自动生成）' }"
       />
     </n-card>

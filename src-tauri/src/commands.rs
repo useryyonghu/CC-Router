@@ -1034,6 +1034,25 @@ pub fn agent_backups_list(state: State<'_, Arc<AppState>>) -> Vec<AgentBackupDto
     out
 }
 
+/// 删除一个子 Agent 备份文件（界面上「已删除 / 已备份的子 Agent」每行的删除按钮）。
+///
+/// **路径守卫是这条链上唯一的防线**：`path` 来自界面并直接进 `remove_file`，
+/// 所以必须先证明它落在 `backups/agents` 之内（fail-closed，见 `agents::ensure_within_backups_dir`）。
+///
+/// 只删文件、不动接管清单：清单记的是"我们改过哪个文件"，而它的还原路径本身容忍备份缺失
+/// （读不到备份时退化为按清单回放）。所以删掉备份的代价是**不再能逐字节回放**，
+/// 确认框里会把这一点说清楚 —— 而不是假装什么都没变。
+#[tauri::command]
+pub fn agent_backup_delete(path: String) -> Result<(), String> {
+    let dir = crate::app_paths::backups_dir().join("agents");
+    let target = PathBuf::from(&path);
+    agents::ensure_within_backups_dir(&dir, &target).map_err(|e| e.to_string())?;
+    if !target.is_file() {
+        return Err(format!("不是一个文件，拒绝删除：{}", target.display()));
+    }
+    std::fs::remove_file(&target).map_err(|e| format!("删除备份失败：{e}"))
+}
+
 /// 完全查不到原路径时的兜底显示名：去掉 `-<16位hash>` 与 `<stamp>.bak` 尾巴。
 fn strip_backup_suffix(file_name: &str) -> String {
     let stem = file_name.strip_suffix(".bak").unwrap_or(file_name);

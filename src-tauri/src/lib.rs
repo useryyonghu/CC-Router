@@ -115,6 +115,7 @@ pub fn run() {
             commands::agent_delete,
             commands::agent_set_model,
             commands::agent_backups_list,
+            commands::agent_backup_delete,
             commands::agents_list,
             commands::autostart_get,
             commands::autostart_set,
