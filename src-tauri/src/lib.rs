@@ -18,6 +18,13 @@ pub fn run() {
         .expect("无法加载 config.json：请检查 %APPDATA%\\cc-router\\config.json");
     let state = AppState::new(store).shared();
 
+    // spec §6.7：`ui.requestLogToFile` 为真时把请求日志镜像到
+    // `<logsDir>/requests-<YYYY-MM-DD>.jsonl`。此前这个开关没有任何调用方 ——
+    // 配置存得下、界面点得动，但一个字节也不会落盘。
+    if let Some(path) = commands::enable_file_logging_if_configured(&state) {
+        eprintln!("[cc-router] 请求日志落盘：{}", path.display());
+    }
+
     tauri::Builder::default()
         .manage(state)
         .invoke_handler(tauri::generate_handler![

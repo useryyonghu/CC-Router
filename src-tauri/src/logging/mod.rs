@@ -209,4 +209,80 @@ mod tests {
         assert!(e.alias.is_empty() && e.provider_id.is_empty() && e.upstream_model.is_empty());
         assert!(!e.stream);
     }
+
+    /// spec §6.7 的 JSONL sink（`ui.requestLogToFile` 落地用）。此前它**零覆盖**：
+    /// `set_file_logging` 连一个调用方都没有，落盘分支从未被任何用例走过。
+    ///
+    /// 这里钉住：未启用时一个文件都不建；启用后写入**恰好一行**完整 JSON（字段名与
+    /// spec §6.7 的字段表一一对应）；关闭后不再追加；重新启用是**追加**而不是截断。
+    #[test]
+    fn set_file_logging_mirrors_entries_to_jsonl_and_stops_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        // 父目录故意不存在：sink 必须自己建（真实场景里 logs/ 可能还没被创建过）
+        let path = dir.path().join("nested/requests-2026-09-22.jsonl");
+        let log = RequestLog::new(10);
+
+        log.push(LogEntry::routing_error("POST", "/v1/messages", "ccr-before", 500, 1, "未启用"));
+        assert!(!path.exists(), "未启用时不得创建任何文件");
+
+        log.set_file_logging(true, path.clone());
+        log.push(LogEntry::routing_error("POST", "/v1/messages", "ccr-typo", 400, 7, "未知模型"));
+
+        let text = std::fs::read_to_string(&path).expect("启用后必须落盘（含自动建父目录）");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "只应有启用之后的那一条: {text:?}");
+
+        let entry: serde_json::Value = serde_json::from_str(lines[0]).expect("必须是合法 JSON 行");
+        assert!(
+            entry["ts"].as_str().map(|s| !s.is_empty()).unwrap_or(false),
+            "ts 必须是非空字符串: {entry}"
+        );
+        assert_eq!(entry["method"], "POST");
+        assert_eq!(entry["path"], "/v1/messages");
+        assert_eq!(entry["requestedModel"], "ccr-typo");
+        assert_eq!(entry["matchedBy"], "error");
+        assert_eq!(entry["role"], serde_json::Value::Null);
+        assert_eq!(entry["alias"], "");
+        assert_eq!(entry["providerId"], "");
+        assert_eq!(entry["upstreamModel"], "");
+        assert_eq!(entry["status"], 400);
+        assert_eq!(entry["stream"], false);
+        assert_eq!(entry["latencyMs"], 7);
+        assert_eq!(entry["error"], "未知模型");
+        // 键集合与 spec §6.7 的字段表完全一致（不是"至少包含"）
+        let mut keys: Vec<String> = entry.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "alias",
+                "error",
+                "latencyMs",
+                "matchedBy",
+                "method",
+                "path",
+                "providerId",
+                "requestedModel",
+                "role",
+                "status",
+                "stream",
+                "ts",
+                "upstreamModel",
+            ],
+            "JSONL 行的字段必须与 spec §6.7 一致"
+        );
+
+        log.set_file_logging(false, path.clone());
+        log.push(LogEntry::routing_error("POST", "/v1/messages", "ccr-after", 400, 1, "关闭后"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().lines().count(),
+            1,
+            "关闭后不得再写入"
+        );
+
+        // 重新启用同一条路径：继续追加，不截断已有日志
+        log.set_file_logging(true, path.clone());
+        log.push(LogEntry::routing_error("POST", "/v1/messages", "ccr-again", 200, 1, "重新启用"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+    }
 }

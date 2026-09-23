@@ -30,6 +30,35 @@ impl AppState {
     }
 }
 
+/// 请求日志落盘的文件路径：`<logsDir>/requests-<YYYY-MM-DD>.jsonl`（spec §6.7）。
+pub fn request_log_file_path(logs_dir: &Path, date: &str) -> PathBuf {
+    logs_dir.join(format!("requests-{date}.jsonl"))
+}
+
+/// 按 `ui.requestLogToFile` 决定是否把请求日志镜像到 JSONL（spec §6.7）。
+///
+/// 返回实际启用的文件路径；开关关闭时返回 `None` 且**不碰任何路径**。
+/// 拆成可注入 `logs_dir` / `date` 的版本，是为了让普通 `cargo test` 能覆盖这段接线
+/// （`run()` 需要 Tauri 运行时，测试里构造不出来）。
+pub fn enable_file_logging_if_configured_at(
+    state: &AppState,
+    logs_dir: &Path,
+    date: &str,
+) -> Option<PathBuf> {
+    if !state.store.snapshot().ui.request_log_to_file {
+        return None;
+    }
+    let path = request_log_file_path(logs_dir, date);
+    state.log.set_file_logging(true, path.clone());
+    Some(path)
+}
+
+/// [`enable_file_logging_if_configured_at`] 的真实入口：`app_paths::logs_dir()` + 当天日期。
+pub fn enable_file_logging_if_configured(state: &AppState) -> Option<PathBuf> {
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    enable_file_logging_if_configured_at(state, &crate::app_paths::logs_dir(), &date)
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayStatus {
@@ -998,5 +1027,49 @@ mod tests {
 
         let pick: FetchPickDto = serde_json::from_str(r#"{"id":"m3"}"#).unwrap();
         assert_eq!(pick.name, None);
+    }
+
+    /// spec §6.7：`ui.requestLogToFile` 必须真的接上 JSONL sink。
+    ///
+    /// 修复前这个配置项**没有任何调用方**（`RequestLog::set_file_logging` 全仓库零引用），
+    /// 开关只存配置、不产生文件 —— 这里走的是 `run()` 会调用的同一段逻辑
+    /// （`enable_file_logging_if_configured_at`，注入临时 logs 目录与固定日期）。
+    #[test]
+    fn request_log_to_file_wires_the_jsonl_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConfigStore::load(dir.path().join("config.json")).unwrap();
+
+        // 打开开关
+        let mut cfg = store.snapshot();
+        cfg.ui.request_log_to_file = true;
+        store.save(cfg).unwrap();
+        let state = AppState::new(store);
+
+        let logs = dir.path().join("logs");
+        let path = enable_file_logging_if_configured_at(&state, &logs, "2026-09-22")
+            .expect("requestLogToFile=true 时必须启用 JSONL sink");
+        assert_eq!(path, logs.join("requests-2026-09-22.jsonl"));
+        assert_eq!(
+            request_log_file_path(&logs, "2026-09-22"),
+            logs.join("requests-2026-09-22.jsonl")
+        );
+
+        state.log.push(LogEntry::routing_error("POST", "/v1/messages", "ccr-x", 400, 3, "boom"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().lines().count(),
+            1,
+            "配置打开后条目必须落盘"
+        );
+
+        // 关掉开关：既不再启用新 sink，也不写任何文件
+        let mut cfg = state.store.snapshot();
+        cfg.ui.request_log_to_file = false;
+        state.store.save(cfg).unwrap();
+        let logs2 = dir.path().join("logs2");
+        assert!(
+            enable_file_logging_if_configured_at(&state, &logs2, "2026-09-22").is_none(),
+            "开关关闭时不得启用 sink"
+        );
+        assert!(!logs2.exists(), "开关关闭时不得创建日志目录/文件");
     }
 }
