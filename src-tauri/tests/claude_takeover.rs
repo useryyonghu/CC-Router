@@ -33,6 +33,10 @@ use std::path::Path;
 /// 2. `attribution` 内层用 6 空格缩进，而 `to_string_pretty` 会写成 4 空格。
 /// 因此任何"重新序列化"的还原路径都必然产出不同字节 —— 只有真正回放接管前原始字节的
 /// `Verbatim` 路径才能通过该用例。
+///
+/// **夹具里绝不允许出现真实密钥。** 本夹具曾是照抄开发机上真实 `settings.json` 的形状，
+/// 连带把一把真实 token 抄了进来（上传 GitHub 前已替换为等长的假值）。
+/// 照抄真实文件时必须逐字段核对，凭据一律换成假值。
 const REAL_SHAPE: &str = r#"{
   "attribution": {
       "commit": "",
