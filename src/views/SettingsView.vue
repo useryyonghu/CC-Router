@@ -60,11 +60,21 @@ watch(
   { immediate: true },
 );
 
-const portChanged = computed(() => {
+/**
+ * 「立即重启网关」只在**已经保存的端口**与运行中的网关端口不一致时出现（M5）。
+ * 不再看本地草稿：草稿还没保存就点，只会用旧端口重启，却提示「已按新端口重启」——
+ * 那是一条假成功。保存成功后 `config.gateway.port` 变了，按钮才会出现。
+ */
+const restartNeeded = computed(() => {
   const config = store.config;
-  if (!config || port.value === null) return false;
-  if (port.value !== config.gateway.port) return true;
-  return store.gatewayRunning && store.gatewayStatus?.port !== config.gateway.port;
+  if (!config || !store.gatewayRunning) return false;
+  return store.gatewayStatus?.port !== config.gateway.port;
+});
+
+/** 端口输入框里改了但还没保存：给一句提示，免得「立即重启网关」看起来凭空消失了。 */
+const portDirty = computed(() => {
+  const config = store.config;
+  return !!config && port.value !== null && port.value !== config.gateway.port;
 });
 
 function saveSettings() {
@@ -307,14 +317,14 @@ onMounted(() => {
             保存设置
           </n-button>
           <n-button
-            v-if="portChanged"
+            v-if="restartNeeded"
             size="small"
             :loading="isBusy('restart')"
-            :disabled="!store.gatewayRunning"
             @click="restartGateway"
           >
             立即重启网关
           </n-button>
+          <n-text v-if="portDirty" depth="3">端口已修改，先点「保存设置」，重启按钮才会出现</n-text>
         </n-space>
       </n-form-item>
       <n-text depth="3">
