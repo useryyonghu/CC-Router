@@ -355,11 +355,13 @@ fn record_agent_change(
 /// 改一个子 Agent 的 `model` 行，并把还原清单记进 `takeover.agentFiles`。
 pub fn agent_set_model_impl(
     store: &ConfigStore,
-    _agents_dir: &Path,
+    agents_dir: &Path,
     backups_dir: &Path,
     path: &Path,
     choice: ModelChoice<'_>,
 ) -> Result<(), String> {
+    // spec §9 纵深防御：接进来的是前端给的任意路径字符串，先确认它真在 agents 目录之内。
+    agents::ensure_within_agents_dir(agents_dir, path).map_err(|e| e.to_string())?;
     // 键必须在**改动之前**取：此时文件还在，canonicalize 才能把它规范化。
     let key = agents::manifest_key(path);
     let entry = agents::set_model_recorded(path, choice, backups_dir).map_err(|e| e.to_string())?;
@@ -379,6 +381,14 @@ pub fn agent_create_impl(
     let entry =
         agents::create_agent_recorded(agents_dir, name, description, choice, body, backups_dir)
             .map_err(|e| e.to_string())?;
+    // spec §9：本命令只接受**名称**（不接受路径），`validate_agent_name` 已禁止分隔符与 `..`，
+    // 所以这层守卫正常不会触发；留着是为了兜住文件系统层的意外（例如 agents 目录本身是个
+    // 指向别处的联接）。真触发时把刚建的文件撤掉再报错，绝不留下一个"在 agents 目录之外、
+    // 我们却以为在里面"的文件。
+    if let Err(e) = agents::ensure_within_agents_dir(agents_dir, &entry.path) {
+        let _ = std::fs::remove_file(&entry.path);
+        return Err(e.to_string());
+    }
     // 新建的键只能在写盘之后取：文件此时才存在。
     let key = agents::manifest_key(&entry.path);
     record_agent_change(store, backups_dir, &key, &entry)?;
@@ -388,10 +398,12 @@ pub fn agent_create_impl(
 /// 删除子 Agent，并把还原清单记进 `takeover.agentFiles`（还原靠删除前的备份回放）。
 pub fn agent_delete_impl(
     store: &ConfigStore,
-    _agents_dir: &Path,
+    agents_dir: &Path,
     backups_dir: &Path,
     path: &Path,
 ) -> Result<(), String> {
+    // spec §9：删除是不可逆的，越界路径必须先拒。
+    agents::ensure_within_agents_dir(agents_dir, path).map_err(|e| e.to_string())?;
     let key = agents::manifest_key(path);
     let entry = agents::delete_agent_recorded(path, backups_dir).map_err(|e| e.to_string())?;
     record_agent_change(store, backups_dir, &key, &entry)

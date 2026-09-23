@@ -924,6 +924,64 @@ fn degraded_restore_puts_the_model_line_back_at_its_original_index() {
     );
 }
 
+/// spec §9 纵深防御：三个子 Agent 命令接受的是前端传来的**任意路径字符串**。
+/// 不校验时，一个拼接错误的路径就能改写/删除用户任意可写文件。
+/// 库侧 `ensure_within_agents_dir` 早就存在且被单测覆盖，这里验的是**它真的接在命令上**：
+/// 目录外的绝对路径与 `..` 回退都必须被拒，且目标文件一个字节都不能动。
+#[test]
+fn agent_commands_reject_paths_outside_the_agents_dir() {
+    use cc_router::commands::{agent_delete_impl, agent_set_model_impl};
+    use cc_router::config::store::ConfigStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let agents = dir.path().join("agents");
+    fs::create_dir_all(&agents).unwrap();
+    let inside = agents.join("ok.md");
+    fs::write(&inside, "---\nname: ok\n---\n正文\n").unwrap();
+
+    // 目录外的目标：同级的"别处"，以及规范化后与它等价的 `..` 回退路径
+    let elsewhere = dir.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let outside = elsewhere.join("important.md");
+    let secret = "---\nname: not-an-agent\n---\n不要动我\n";
+    fs::write(&outside, secret).unwrap();
+    let traversal = agents.join("../elsewhere/important.md");
+
+    let store = ConfigStore::load(dir.path().join("config.json")).unwrap();
+    let backups = dir.path().join("backups");
+
+    for escape in [&outside, &traversal] {
+        let err = agent_set_model_impl(
+            &store,
+            &agents,
+            &backups,
+            escape,
+            ModelChoice::Alias("ccr-x"),
+        )
+        .unwrap_err();
+        assert!(err.contains("不在子 Agent 目录"), "越界路径必须被明确拒绝: {err}");
+        assert_eq!(
+            fs::read(&outside).unwrap(),
+            secret.as_bytes(),
+            "被拒的路径一个字节都不能改（{}）",
+            escape.display()
+        );
+        assert!(
+            store.snapshot().takeover.agent_files.is_empty(),
+            "被拒的改动不得进还原清单"
+        );
+
+        let err = agent_delete_impl(&store, &agents, &backups, escape).unwrap_err();
+        assert!(err.contains("不在子 Agent 目录"), "删除同样必须拒绝: {err}");
+        assert!(outside.exists(), "被拒的路径不得被删除（{}）", escape.display());
+    }
+
+    // 目录内照常工作（守卫不能把正常路径也挡掉）
+    agent_set_model_impl(&store, &agents, &backups, &inside, ModelChoice::Alias("ccr-x")).unwrap();
+    assert!(read_text(&inside).contains("model: ccr-x"));
+    assert_eq!(store.snapshot().takeover.agent_files.len(), 1);
+}
+
 // ---------------------------------------------------------------- 修复轮 1
 
 /// CRITICAL：子 Agent 目录是**递归**的，两个不同子目录下的同名文件在同一次操作里
