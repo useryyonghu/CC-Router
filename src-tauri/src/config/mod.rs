@@ -157,14 +157,29 @@ pub struct TakeoverState {
     pub backup_file: Option<String>,
     #[serde(default)]
     pub settings_keys: serde_json::Value,
-    #[serde(default)]
-    pub agent_files: serde_json::Value,
+    /// spec §8.3 的还原清单：**以文件路径为键**，值为 `AgentManifestEntry`。
+    ///
+    /// 键用规范路径（`claude::agents::manifest_key`），这样"同一文件的两种写法"命中同一条
+    /// 记录，"首次写入优先"的去重才成立（还原要回到**最早**的原状，而不是中间态）。
+    ///
+    /// 旧 config.json 里这个字段是 `null`（当时没有任何写入方），因此反序列化必须容忍 `null`；
+    /// 见 `agent_files_from_json`。
+    #[serde(default, deserialize_with = "agent_files_from_json")]
+    pub agent_files: crate::claude::agents::AgentManifestMap,
     /// `claude::settings::TakeoverManifest` 的序列化形式：**精确还原的唯一依据**。
     ///
     /// 存进配置而不仅放内存，是为了让还原在应用重启后仍然可用；`serde(default)` 保证
     /// 没有该字段的旧 config.json（本字段加入之前写的）仍能正常反序列化。
     #[serde(default)]
     pub manifest: Option<serde_json::Value>,
+}
+
+/// `agentFiles` 的历史写法兼容：缺字段、`null`（旧 config.json 的默认值）、对象三种都能读。
+fn agent_files_from_json<'de, D>(de: D) -> Result<crate::claude::agents::AgentManifestMap, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<crate::claude::agents::AgentManifestMap>::deserialize(de)?.unwrap_or_default())
 }
 
 impl Config {

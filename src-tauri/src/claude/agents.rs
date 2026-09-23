@@ -61,10 +61,10 @@ pub struct AgentFile {
 
 /// 还原清单条目（spec §8.3）。
 ///
-/// 与 spec 的 `{path, existed, modelLine}` 相比多了三个字段，都是为了在**没有备份**时
+/// 与 spec 的 `{path, existed, modelLine}` 相比多了四个字段，都是为了在**没有备份**时
 /// 也能逐字节还原：`had_frontmatter`（原本没有 frontmatter 时要删掉我们插入的整块）、
 /// `crlf` / `trailing_newline`（重建插入行时的换行风格）、`backup_file`（有备份时优先
-/// 逐字节回放）。
+/// 逐字节回放）、`model_line_index`（把被删掉的 `model:` 行插回**原位置**而不是紧贴 `---`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentManifestEntry {
@@ -73,6 +73,12 @@ pub struct AgentManifestEntry {
     /// 原始 `model:` 行文本（**含其行尾换行符**；原本没有该行时为 `None`）。
     #[serde(default)]
     pub model_line: Option<String>,
+    /// 原始 `model:` 行的行号（**1 起**；原本没有该行时为 `None`）。
+    ///
+    /// 降级还原（备份不可用）时靠它把行插回原位：只看 `model_line` 文本时，只能把行塞在
+    /// `---` 之后，而原位置可能在第 3、第 5 行 —— 还原出来的文件与原文不同。
+    #[serde(default)]
+    pub model_line_index: Option<usize>,
     #[serde(default)]
     pub crlf: bool,
     #[serde(default)]
@@ -83,6 +89,9 @@ pub struct AgentManifestEntry {
     #[serde(default)]
     pub backup_file: Option<String>,
 }
+
+/// spec §8.3 的 `takeover.agentFiles`：**以文件路径为键**的还原清单。
+pub type AgentManifestMap = std::collections::BTreeMap<String, AgentManifestEntry>;
 
 /// 递归列出 `agents_dir/**/*.md`，按路径排序。目录不存在时返回空表（首次使用时的常态）。
 pub fn list_agents(agents_dir: &Path) -> Result<Vec<AgentFile>> {
@@ -164,6 +173,7 @@ pub fn set_model_recorded_at(
         path: path.to_path_buf(),
         existed: true,
         model_line: model_index.map(|i| lines[i].to_string()),
+        model_line_index: model_index.map(|i| i + 1),
         crlf: detect_newline(&original) == "\r\n",
         trailing_newline: original.ends_with('\n'),
         had_frontmatter: frontmatter.is_some(),
@@ -209,6 +219,31 @@ pub fn create_agent(
     Ok(path)
 }
 
+/// [`create_agent`] 的记录版：同时返回还原清单条目（spec §8.3）。
+///
+/// `existed: false` —— 这个文件原本不存在，还原时必须**删除**它（删之前先备份，
+/// 见 [`restore_agent`]：绝不无声销毁内容）。
+pub fn create_agent_recorded(
+    agents_dir: &Path,
+    name: &str,
+    description: &str,
+    choice: ModelChoice<'_>,
+    body: &str,
+    backups_dir: &Path,
+) -> Result<AgentManifestEntry> {
+    let path = create_agent(agents_dir, name, description, choice, body, backups_dir)?;
+    Ok(AgentManifestEntry {
+        path,
+        existed: false,
+        model_line: None,
+        model_line_index: None,
+        crlf: false,
+        trailing_newline: false,
+        had_frontmatter: false,
+        backup_file: None,
+    })
+}
+
 /// 删除子 Agent：**先备份再删除**（spec §8.2）。
 pub fn delete_agent(path: &Path, backups_dir: &Path) -> Result<()> {
     delete_agent_at(path, backups_dir, &super::backup_stamp())
@@ -216,9 +251,67 @@ pub fn delete_agent(path: &Path, backups_dir: &Path) -> Result<()> {
 
 /// 与 [`delete_agent`] 相同，但可显式指定备份时间戳（理由见 [`set_model_recorded_at`]）。
 pub fn delete_agent_at(path: &Path, backups_dir: &Path, stamp: &str) -> Result<()> {
+    delete_agent_recorded_at(path, backups_dir, stamp).map(|_| ())
+}
+
+/// [`delete_agent`] 的记录版：同时返回还原清单条目（spec §8.3）。
+///
+/// 条目只带 `existed: true` 与备份文件名：删除是不可逆的内容销毁，**只能**靠备份逐字节回放；
+/// 清单里的 `model_line` 之类无法重建被删掉的正文，所以不写进条目假装降级路径可用。
+pub fn delete_agent_recorded(path: &Path, backups_dir: &Path) -> Result<AgentManifestEntry> {
+    delete_agent_recorded_at(path, backups_dir, &super::backup_stamp())
+}
+
+/// 与 [`delete_agent_recorded`] 相同，但可显式指定备份时间戳。
+pub fn delete_agent_recorded_at(
+    path: &Path,
+    backups_dir: &Path,
+    stamp: &str,
+) -> Result<AgentManifestEntry> {
     let bytes = std::fs::read(path).map_err(|e| Error::io(path.to_path_buf(), e))?;
-    write_backup_once(path, &bytes, backups_dir, stamp)?;
-    std::fs::remove_file(path).map_err(|e| Error::io(path.to_path_buf(), e))
+    let backup_file = write_backup_once(path, &bytes, backups_dir, stamp)?;
+    std::fs::remove_file(path).map_err(|e| Error::io(path.to_path_buf(), e))?;
+    Ok(AgentManifestEntry {
+        path: path.to_path_buf(),
+        existed: true,
+        model_line: None,
+        model_line_index: None,
+        crlf: false,
+        trailing_newline: false,
+        had_frontmatter: false,
+        backup_file: Some(backup_file),
+    })
+}
+
+/// 还原清单的键：能用规范路径就用规范路径。
+///
+/// 同一文件的两种写法（大小写、`..`、符号链接、`\\?\` 前缀）必须命中**同一条**记录：
+/// 否则"首次写入优先"的去重失效 —— 第二次改动另起一条记录，还原时两条都会被回放，
+/// 结果停在中间态而不是改动前的原状。因此调用方要在**改动文件之前**取键（文件还在，
+/// canonicalize 能成功）；新建文件只能在其写盘之后取键。
+pub fn manifest_key(path: &Path) -> String {
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let raw = resolved.to_string_lossy().to_string();
+    raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string()
+}
+
+/// 批量还原（spec §8.3：一键还原要把清单里的每个子 Agent 文件都回放回去）。
+///
+/// 返回 `(成功还原的路径, 失败描述)`。**不因为一个文件失败就提前中断**：否则排在后面的文件
+/// 会永远停在改动后的状态，而调用方只看到一个错误。
+pub fn restore_agents<'a, I>(entries: I, backups_dir: &Path) -> (Vec<PathBuf>, Vec<String>)
+where
+    I: IntoIterator<Item = &'a AgentManifestEntry>,
+{
+    let mut restored = Vec::new();
+    let mut failed = Vec::new();
+    for entry in entries {
+        match restore_agent(entry, backups_dir) {
+            Ok(()) => restored.push(entry.path.clone()),
+            Err(e) => failed.push(format!("{}: {e}", entry.path.display())),
+        }
+    }
+    (restored, failed)
 }
 
 /// 按清单还原一个子 Agent（spec §8.3）。
@@ -431,19 +524,40 @@ fn rebuild(text: &str, entry: &AgentManifestEntry) -> Result<String> {
         return Ok(out);
     }
 
+    // 当前**没有** `model:` 行（`SubagentDefault` 把它删掉了）→ 把原行插回**原位置**。
+    // 依据是清单里的 `model_line_index`；只凭行文本时"第 4 行"会被插成"第 2 行"，
+    // 还原结果与原文不再逐字节相等。旧清单没有行号时退化为"紧跟 `---` 之后"（旧行为）。
+    if model_index.is_none() {
+        let Some(original) = &entry.model_line else {
+            return Ok(text.to_string());
+        };
+        let insert_at = entry
+            .model_line_index
+            .map(|n| n.saturating_sub(1))
+            .filter(|at| *at <= lines.len())
+            // 没有行号（或行号越界）：插在开标签 `---` 之后。
+            .unwrap_or(open + 1)
+            // 绝不插到开标签之前：那会破坏 frontmatter。
+            .max(1);
+        let mut out = String::with_capacity(text.len() + original.len());
+        for (i, line) in lines.iter().enumerate() {
+            if i == insert_at {
+                out.push_str(original);
+            }
+            out.push_str(line);
+        }
+        if insert_at >= lines.len() {
+            out.push_str(original);
+        }
+        return Ok(out);
+    }
+
     let mut out = String::with_capacity(text.len() + 32);
     for (i, line) in lines.iter().enumerate() {
         match (model_index, &entry.model_line) {
             (Some(idx), Some(original)) if i == idx => out.push_str(original),
             (Some(idx), None) if i == idx => {}
-            _ => {
-                out.push_str(line);
-                if i == open {
-                    if let (None, Some(original)) = (model_index, &entry.model_line) {
-                        out.push_str(original);
-                    }
-                }
-            }
+            _ => out.push_str(line),
         }
     }
     Ok(out)

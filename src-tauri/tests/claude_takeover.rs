@@ -792,6 +792,138 @@ fn legacy_config_without_manifest_field_still_deserializes() {
     assert_eq!(cfg.gateway.port, 8787);
 }
 
+// ---------------------------------------------------------------- Wave 2a
+
+/// spec §8.3：改动子 Agent 文件必须把 `AgentManifestEntry` 记进 `takeover.agentFiles`，
+/// 且「一键还原」要把这些改动一起回退 —— 两者同属"接管"这一状态（spec §8.3 的注）。
+///
+/// 全程走 IPC 命令的**实现体**（`agent_set_model_impl` / `takeover_restore_impl`），
+/// 并用 `load_from` 从磁盘重新读配置来模拟"改完 → 应用重启 → 点一键还原"。
+#[test]
+fn agent_edit_is_persisted_and_takeover_restore_replays_it() {
+    use cc_router::commands::{agent_set_model_impl, takeover_restore_impl};
+    use cc_router::config::store::ConfigStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let settings_path = dir.path().join("settings.json");
+    let backups = dir.path().join("backups");
+    let agents = dir.path().join("agents");
+    fs::create_dir_all(&agents).unwrap();
+    let target = agents.join("reviewer.md");
+    let original = "---\nname: reviewer\ndescription: 审查\n---\n正文\n";
+    fs::write(&target, original).unwrap();
+    let settings_before = REAL_SHAPE.as_bytes();
+    fs::write(&settings_path, settings_before).unwrap();
+
+    let store = ConfigStore::load(dir.path().join("config.json")).unwrap();
+    let mut cfg = demo_cfg();
+    let manifest = apply_takeover(&cfg, &settings_path, &backups).unwrap();
+    cfg.takeover = TakeoverState {
+        enabled: true,
+        applied_at: Some(manifest.applied_at.clone()),
+        backup_file: Some(manifest.pre_bytes_file.clone()),
+        manifest: Some(serde_json::to_value(&manifest).unwrap()),
+        ..TakeoverState::default()
+    };
+    store.save(cfg).unwrap();
+    assert_ne!(fs::read(&settings_path).unwrap(), settings_before, "接管必须改了 settings.json");
+
+    agent_set_model_impl(&store, &agents, &backups, &target, ModelChoice::Alias("ccr-kimi-k3"))
+        .unwrap();
+    assert!(read_text(&target).contains("model: ccr-kimi-k3"), "必须真的改了文件");
+
+    // 模拟重启：只从磁盘读配置
+    let reloaded = cc_router::config::store::load_from(store.path()).unwrap();
+    assert_eq!(
+        reloaded.takeover.agent_files.len(),
+        1,
+        "子 Agent 改动必须落盘到 takeover.agentFiles（spec §8.3），实际: {:?}",
+        reloaded.takeover.agent_files
+    );
+    let (key, entry) = reloaded.takeover.agent_files.iter().next().unwrap();
+    assert!(key.contains("reviewer.md"), "键必须是文件路径: {key}");
+    assert!(entry.existed && entry.backup_file.is_some(), "{entry:?}");
+
+    // 一键还原：settings.json 与子 Agent 文件都要回退
+    let dto = takeover_restore_impl(&store, &settings_path, &backups).unwrap();
+    assert_eq!(dto.path, "verbatim");
+    assert_eq!(
+        fs::read(&settings_path).unwrap(),
+        settings_before,
+        "settings.json 必须逐字节还原（spec §7.3）"
+    );
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        original.as_bytes(),
+        "一键还原必须把子 Agent 文件也改回原文（spec §8.3）"
+    );
+    assert!(store.snapshot().takeover.agent_files.is_empty(), "还原后清单必须清空");
+    assert!(!store.snapshot().takeover.enabled);
+}
+
+/// 清单没落盘时，**文件改动绝不能留下**：`ConfigStore::save` 先校验后写盘（见 `config/store.rs`），
+/// 所以"改文件 → 记清单 → 落盘"的顺序可以把不一致收敛到一次回滚里。
+#[test]
+fn failed_manifest_save_rolls_the_agent_file_back() {
+    use cc_router::commands::agent_set_model_impl;
+    use cc_router::config::store::ConfigStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let agents = dir.path().join("agents");
+    fs::create_dir_all(&agents).unwrap();
+    let target = agents.join("reviewer.md");
+    let original = "---\nname: reviewer\n---\n正文\n";
+    fs::write(&target, original).unwrap();
+    let backups = dir.path().join("backups");
+
+    let store = ConfigStore::load(dir.path().join("config.json")).unwrap();
+    // 让 `save` 必然失败：端口 1 不在 1024..=65535 内 → 校验拒绝（且磁盘不动）。
+    let mut broken = store.snapshot();
+    broken.gateway.port = 1;
+    store.replace_in_memory(broken);
+
+    let err = agent_set_model_impl(&store, &agents, &backups, &target, ModelChoice::Alias("ccr-x"))
+        .unwrap_err();
+    assert!(err.contains("回滚"), "错误必须说明已回滚: {err}");
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        original.as_bytes(),
+        "清单保存失败时，子 Agent 文件必须逐字节回到改动前"
+    );
+    assert!(store.snapshot().takeover.agent_files.is_empty(), "失败时内存里的清单也不得留下条目");
+}
+
+/// 降级还原（备份不可用）必须把原 `model:` 行放回**原位置**，而不是紧贴 `---`。
+/// 位置只能来自清单里的行号：spec §8.3 只要求 `modelLine` 文本，
+/// 只凭文本时"原位置"无从谈起（第 4 行会被插到第 2 行）。
+#[test]
+fn degraded_restore_puts_the_model_line_back_at_its_original_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let backups = dir.path().join("backups");
+    let path = dir.path().join("positional.md");
+    let original =
+        "---\nname: reviewer\ndescription: 审查\nmodel: ccr-old\ntools: Read\n---\n\n正文\n";
+    fs::write(&path, original).unwrap();
+
+    // SubagentDefault = 删除 model 行；备份随后被清理，只能靠清单重建。
+    let entry = set_model_recorded(&path, ModelChoice::SubagentDefault, &backups).unwrap();
+    let after_edit = read_text(&path);
+    assert!(!after_edit.contains("model:"), "编辑后 model 行必须消失: {after_edit:?}");
+    assert_eq!(
+        entry.model_line_index,
+        Some(4),
+        "清单必须记下原 `model:` 行的行号（1 起）"
+    );
+    fs::remove_file(backups.join(entry.backup_file.as_ref().unwrap())).unwrap();
+
+    restore_agent(&entry, &backups).unwrap();
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        original.as_bytes(),
+        "降级还原必须把 model 行插回第 4 行，而不是紧跟 `---`"
+    );
+}
+
 // ---------------------------------------------------------------- 修复轮 1
 
 /// CRITICAL：子 Agent 目录是**递归**的，两个不同子目录下的同名文件在同一次操作里

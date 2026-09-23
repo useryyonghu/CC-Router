@@ -1,5 +1,5 @@
 use crate::claude::{agents, settings as claude_settings};
-use crate::claude::agents::ModelChoice;
+use crate::claude::agents::{AgentManifestEntry, ModelChoice};
 use crate::config::{store::ConfigStore, validate::validate, Config, TakeoverState};
 use crate::gateway::server::Gateway;
 use crate::logging::{LogEntry, RequestLog};
@@ -193,8 +193,19 @@ pub fn takeover_apply(state: State<'_, Arc<AppState>>) -> Result<TakeoverStatusD
 
 #[tauri::command]
 pub fn takeover_restore(state: State<'_, Arc<AppState>>) -> Result<RestoreDto, String> {
-    let mut cfg = state.store.snapshot();
     let (settings_path, backups_dir) = state.claude_paths();
+    takeover_restore_impl(&state.store, &settings_path, &backups_dir)
+}
+
+/// [`takeover_restore`] 的实现体（spec §7.3 的 settings.json 还原 + §8.3 的子 Agent 清单回放）。
+///
+/// 与命令外壳分离是为了能用普通 `cargo test` 覆盖"一键还原同时回退两类改动"。
+pub fn takeover_restore_impl(
+    store: &ConfigStore,
+    settings_path: &Path,
+    backups_dir: &Path,
+) -> Result<RestoreDto, String> {
+    let mut cfg = store.snapshot();
 
     let manifest = match cfg.takeover.manifest.clone() {
         Some(value) => serde_json::from_value::<claude_settings::TakeoverManifest>(value)
@@ -205,11 +216,27 @@ pub fn takeover_restore(state: State<'_, Arc<AppState>>) -> Result<RestoreDto, S
         None => return Err("当前没有接管记录，无需还原".to_string()),
     };
 
-    let outcome = claude_settings::restore(&manifest, &settings_path, &backups_dir)
+    let outcome = claude_settings::restore(&manifest, settings_path, backups_dir)
         .map_err(|e| e.to_string())?;
 
+    // spec §8.3：子 Agent 的改动与 settings.json 同属"接管"这一状态，一键还原要一起回退。
+    // 一个文件失败不中断其余文件（否则排后面的会永远停在改动后的状态）。
+    let agent_files = cfg.takeover.agent_files.clone();
+    let (restored, failed) = agents::restore_agents(agent_files.values(), backups_dir);
+    if !failed.is_empty() {
+        return Err(format!(
+            "settings.json 已还原，但以下子 Agent 文件还原失败：{}。\
+             接管记录已保留，修正后请再点一次「一键还原」（原文在 {} 的 *.bak 里）",
+            failed.join("；"),
+            backups_dir.display()
+        ));
+    }
+    if !restored.is_empty() {
+        eprintln!("[cc-router] 一键还原：已回放 {} 个子 Agent 文件", restored.len());
+    }
+
     cfg.takeover = TakeoverState::default();
-    state.store.save(cfg).map_err(|e| e.to_string())?;
+    store.save(cfg).map_err(|e| e.to_string())?;
 
     Ok(RestoreDto {
         path: match outcome.path {
@@ -260,7 +287,7 @@ pub fn agent_set_model(
 ) -> Result<(), String> {
     let (_, backups_dir) = state.claude_paths();
     let choice = parse_choice(&choice, alias.as_deref())?;
-    agents::set_model(&PathBuf::from(path), choice, &backups_dir).map_err(|e| e.to_string())
+    agent_set_model_impl(&state.store, &agents::agents_dir(), &backups_dir, &PathBuf::from(path), choice)
 }
 
 #[tauri::command]
@@ -274,22 +301,100 @@ pub fn agent_create(
 ) -> Result<String, String> {
     let (_, backups_dir) = state.claude_paths();
     let choice = parse_choice(&choice, alias.as_deref())?;
-    agents::create_agent(
+    agent_create_impl(
+        &state.store,
         &agents::agents_dir(),
+        &backups_dir,
         &name,
         &description,
         choice,
         &body,
-        &backups_dir,
     )
-    .map(|p| p.to_string_lossy().to_string())
-    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn agent_delete(state: State<'_, Arc<AppState>>, path: String) -> Result<(), String> {
     let (_, backups_dir) = state.claude_paths();
-    agents::delete_agent(&PathBuf::from(path), &backups_dir).map_err(|e| e.to_string())
+    agent_delete_impl(&state.store, &agents::agents_dir(), &backups_dir, &PathBuf::from(path))
+}
+
+// 三个命令的**实现体**（与 IPC 外壳分离）：`State<'_, Arc<AppState>>` 需要 Tauri 运行时才能构造，
+// 把逻辑留在 `*_impl` 里才能用普通 `cargo test` 覆盖"清单落盘 / 落盘失败回滚 / 路径守卫"。
+
+/// 子 Agent 改动的清单落盘（spec §8.3）：`or_insert` = **首次写入优先**。
+///
+/// 同一个文件被改第二次时，第二次的条目记的是"第一次改完之后"的状态；用它还原只会停在
+/// 中间态，而"还原"的语义是回到我们动手**之前**，所以必须保住最早那条记录。
+/// 备份侧同样如此：`write_backup_once` 对同一 (文件, stamp) 只写一次，原文不会被覆盖。
+///
+/// 落盘失败 → 立刻按该条目把文件改动**回滚**：绝不允许"文件已改、清单没落盘"的状态存活，
+/// 那会让改动永久失去还原依据（`ConfigStore::save` 先校验后写盘，所以校验型失败时
+/// 内存与磁盘都没变，回滚一次即彻底收敛）。
+fn record_agent_change(
+    store: &ConfigStore,
+    backups_dir: &Path,
+    key: &str,
+    entry: &AgentManifestEntry,
+) -> Result<(), String> {
+    let mut cfg = store.snapshot();
+    cfg.takeover.agent_files.entry(key.to_string()).or_insert_with(|| entry.clone());
+    if let Err(e) = store.save(cfg) {
+        let path = entry.path.display().to_string();
+        return Err(match agents::restore_agent(entry, backups_dir) {
+            Ok(()) => format!("保存子 Agent 还原清单失败，已把 {path} 回滚到改动前：{e}"),
+            Err(rb) => format!(
+                "保存子 Agent 还原清单失败（{e}），且回滚 {path} 也失败（{rb}）：\
+                 原文在 {} 的 *.bak 里，请手工还原",
+                backups_dir.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// 改一个子 Agent 的 `model` 行，并把还原清单记进 `takeover.agentFiles`。
+pub fn agent_set_model_impl(
+    store: &ConfigStore,
+    _agents_dir: &Path,
+    backups_dir: &Path,
+    path: &Path,
+    choice: ModelChoice<'_>,
+) -> Result<(), String> {
+    // 键必须在**改动之前**取：此时文件还在，canonicalize 才能把它规范化。
+    let key = agents::manifest_key(path);
+    let entry = agents::set_model_recorded(path, choice, backups_dir).map_err(|e| e.to_string())?;
+    record_agent_change(store, backups_dir, &key, &entry)
+}
+
+/// 新建子 Agent，并把还原清单记进 `takeover.agentFiles`；返回新文件路径。
+pub fn agent_create_impl(
+    store: &ConfigStore,
+    agents_dir: &Path,
+    backups_dir: &Path,
+    name: &str,
+    description: &str,
+    choice: ModelChoice<'_>,
+    body: &str,
+) -> Result<String, String> {
+    let entry =
+        agents::create_agent_recorded(agents_dir, name, description, choice, body, backups_dir)
+            .map_err(|e| e.to_string())?;
+    // 新建的键只能在写盘之后取：文件此时才存在。
+    let key = agents::manifest_key(&entry.path);
+    record_agent_change(store, backups_dir, &key, &entry)?;
+    Ok(entry.path.to_string_lossy().to_string())
+}
+
+/// 删除子 Agent，并把还原清单记进 `takeover.agentFiles`（还原靠删除前的备份回放）。
+pub fn agent_delete_impl(
+    store: &ConfigStore,
+    _agents_dir: &Path,
+    backups_dir: &Path,
+    path: &Path,
+) -> Result<(), String> {
+    let key = agents::manifest_key(path);
+    let entry = agents::delete_agent_recorded(path, backups_dir).map_err(|e| e.to_string())?;
+    record_agent_change(store, backups_dir, &key, &entry)
 }
 
 // ---------------------------------------------------------------- 预设目录（spec §5.6 / A1）
