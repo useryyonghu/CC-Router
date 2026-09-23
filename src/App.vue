@@ -102,14 +102,17 @@ onBeforeUnmount(() => store.stopLogPolling());
 
               <div class="topbar">
                 <n-space align="center" :size="12">
-                  <n-text depth="3">网关</n-text>
-                  <n-tag :type="store.gatewayRunning ? 'success' : 'warning'" size="small" round>
-                    {{ store.gatewayRunning ? "运行中" : "未运行" }}
-                  </n-tag>
-                  <n-text depth="3">{{ store.gatewayUrl || "—" }}</n-text>
-                  <n-text depth="3">
-                    服务商 {{ store.providers.length }} · 模型 {{ store.models.length }}
-                  </n-text>
+                  <template v-if="store.ready">
+                    <n-text depth="3">网关</n-text>
+                    <n-tag :type="store.gatewayRunning ? 'success' : 'warning'" size="small" round>
+                      {{ store.gatewayRunning ? "运行中" : "未运行" }}
+                    </n-tag>
+                    <n-text depth="3">{{ store.gatewayUrl || "—" }}</n-text>
+                    <n-text depth="3">
+                      服务商 {{ store.providers.length }} · 模型 {{ store.models.length }}
+                    </n-text>
+                  </template>
+                  <n-text v-else depth="3">正在读取配置…</n-text>
                 </n-space>
               </div>
 
