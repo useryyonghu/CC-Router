@@ -632,6 +632,7 @@ fn create_then_delete_round_trips() {
     assert!(text.contains("model: ccr-kimi-k3\n"));
     assert!(text.ends_with("你是代码审查专家。\n"));
 
+    let created = read_text(&path);
     delete_agent(&path, &backups).unwrap();
     assert!(!path.exists());
     let baks: Vec<String> = fs::read_dir(backups.join("agents"))
@@ -639,11 +640,17 @@ fn create_then_delete_round_trips() {
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().to_string())
         .collect();
-    assert!(
-        // 备份名以**规范化完整路径**为键（避免不同子目录的同名文件互相覆盖），
-        // 因此文件名出现在中段而不是开头。
-        baks.iter().any(|n| n.contains("code-reviewer.md.") && n.ends_with(".bak")),
-        "删除前必须先备份: {baks:?}"
+    // 备份名以**规范化完整路径**为键（避免不同子目录的同名文件互相覆盖），且**无条件**附
+    // 完整路径哈希（扁平化不是单射），因此形态是 `<扁平路径>-<hash>.<stamp>.bak`：
+    // 文件名出现在中段，后面还跟着哈希而不是时间戳。
+    let backup = baks
+        .iter()
+        .find(|n| n.contains("code-reviewer.md-") && n.ends_with(".bak"))
+        .unwrap_or_else(|| panic!("删除前必须先备份: {baks:?}"));
+    assert_eq!(
+        fs::read_to_string(backups.join("agents").join(backup)).unwrap(),
+        created,
+        "删除前的备份必须是该文件删掉之前的确切内容"
     );
 }
 
@@ -849,6 +856,75 @@ fn same_named_agents_in_different_subdirs_do_not_share_backups() {
         baks.iter().any(|b| b == orig_delta.as_bytes()),
         "delta 删除前的原文必须有备份 —— 不得被 gamma 覆盖"
     );
+}
+
+/// CRITICAL：`a/b.md` 与 `a_b.md`（以及 `reviewer pro.md` 与 `reviewer_pro.md`）的
+/// 扁平化结果完全相同 —— 路径分隔符、空格与**已有的下划线**都被压成 `_`。旧实现只在扁平串
+/// 超过 120 字符时才附完整路径哈希，于是这两对真实文件共用同一个备份键：
+/// 第二次备份被 write-if-absent 静默跳过，两份清单都指向第一个备份，
+/// 还原时第一个文件的字节被写进第二个文件，第二个文件的原文**从未备份、不可恢复**。
+/// 这个用例走完整往返（改文件 → 备份 → 按清单还原），在两对路径上各验一次。
+#[test]
+fn paths_that_flatten_alike_still_back_up_and_restore_their_own_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let agents = dir.path().join("agents");
+    let backups = dir.path().join("backups");
+    let stamp = "20260922T153000";
+
+    // (相对路径 A, 相对路径 B, A 的原文, B 的原文)
+    let cases = [
+        (
+            "a/b.md",
+            "a_b.md",
+            "---\nname: A-slash\n---\n甲：走子目录的那个文件\n",
+            "---\nname: A-underscore\n---\n乙：文件名里带下划线的那个文件\n",
+        ),
+        (
+            "reviewer pro.md",
+            "reviewer_pro.md",
+            "---\nname: space\n---\n空格版正文\n",
+            "---\nname: underscore\n---\n下划线版正文\n",
+        ),
+    ];
+
+    for (left_rel, right_rel, orig_left, orig_right) in cases {
+        let left = agents.join(left_rel);
+        let right = agents.join(right_rel);
+        fs::create_dir_all(left.parent().unwrap()).unwrap();
+        fs::write(&left, orig_left).unwrap();
+        fs::write(&right, orig_right).unwrap();
+
+        // 同一次操作、同一个 stamp（这正是"共用一份备份"的触发条件）
+        let el = set_model_recorded_at(&left, ModelChoice::Alias("ccr-kimi-k3"), &backups, stamp)
+            .unwrap();
+        let er = set_model_recorded_at(&right, ModelChoice::Alias("ccr-ds-flash"), &backups, stamp)
+            .unwrap();
+
+        assert_ne!(
+            el.backup_file, er.backup_file,
+            "{left_rel} 与 {right_rel} 绝不能共用同一个备份键"
+        );
+        let bl = backups.join(el.backup_file.as_ref().unwrap());
+        let br = backups.join(er.backup_file.as_ref().unwrap());
+        assert!(
+            bl.exists() && br.exists(),
+            "{left_rel} 与 {right_rel} 的备份都必须落盘（write-if-absent 不得吞掉第二次）: {bl:?} / {br:?}"
+        );
+        assert_eq!(fs::read(&bl).unwrap(), orig_left.as_bytes(), "{left_rel} 的备份必须是它自己的原文");
+        assert_eq!(fs::read(&br).unwrap(), orig_right.as_bytes(), "{right_rel} 的备份必须是它自己的原文");
+
+        assert_ne!(fs::read_to_string(&left).unwrap(), orig_left, "{left_rel} 必须真的被改动过");
+        assert_ne!(fs::read_to_string(&right).unwrap(), orig_right, "{right_rel} 必须真的被改动过");
+
+        restore_agent(&el, &backups).unwrap();
+        restore_agent(&er, &backups).unwrap();
+        assert_eq!(fs::read(&left).unwrap(), orig_left.as_bytes(), "{left_rel} 必须还原成自己的原文");
+        assert_eq!(
+            fs::read(&right).unwrap(),
+            orig_right.as_bytes(),
+            "{right_rel} 必须还原成自己的原文 —— 不得被 {left_rel} 的字节覆盖"
+        );
+    }
 }
 
 /// IMPORTANT 1：post 快照必须**先于** `settings.json` 落盘。

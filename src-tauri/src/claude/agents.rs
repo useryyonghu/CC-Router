@@ -79,7 +79,7 @@ pub struct AgentManifestEntry {
     pub trailing_newline: bool,
     #[serde(default)]
     pub had_frontmatter: bool,
-    /// 改动前的字节备份，路径相对 `backups_root`（如 `agents/a.md.<stamp>.bak`）。
+    /// 改动前的字节备份，路径相对 `backups_root`（如 `agents/a.md-<path-hash>.<stamp>.bak`）。
     #[serde(default)]
     pub backup_file: Option<String>,
 }
@@ -463,6 +463,12 @@ fn looks_like_inserted_block(lines: &[&str]) -> bool {
 /// 子 Agent 目录是递归的（spec §8.1）：`alpha/reviewer.md` 与 `beta/reviewer.md` 若都按
 /// `reviewer.md` 命名，第二次备份会被 write-if-absent 静默跳过，而两次的清单记录指向同一个
 /// 备份文件 —— 还原时会把 alpha 的字节写进 beta，且 beta 的原文从未被备份（不可恢复）。
+///
+/// **完整路径的哈希是无条件附加的**，不是"只在超长时才加"：扁平化把所有非
+/// `[A-Za-z0-9.\-_]` 字符压成 `_`，因此 `/`、`\`、空格与**本来就存在的 `_`** 不可区分 ——
+/// `agents/a/b.md` 与 `agents/a_b.md`、`agents/reviewer pro.md` 与 `agents/reviewer_pro.md`
+/// 都得到同一个 71 字符的扁平串。按长度阈值决定是否加哈希，等于让最常见的短路径落进
+/// 上面那条不可恢复的碰撞路径；只有无条件哈希才能让映射（在 64 位 FNV-1a 的强度内）单射。
 fn backup_name(path: &Path, stamp: &str) -> String {
     // canonicalize 让同一文件的不同写法（大小写、`..`、符号链接）落到同一个键上，
     // 使"同一文件同一 stamp 只备份一次"仍然成立。
@@ -479,11 +485,16 @@ fn backup_name(path: &Path, stamp: &str) -> String {
             flat.push('_');
         }
     }
+    let hash = fnv1a_hex16(&text);
     if flat.len() > 120 {
         // 文件名长度上限（Windows 255）：保留信息量最大的尾部，并附**完整路径**的哈希
         // 以保证截断后仍然唯一。
         let tail = flat[flat.len() - 80..].to_string();
-        flat = format!("{tail}-{}", fnv1a_hex16(&text));
+        flat = format!("{tail}-{hash}");
+    } else {
+        // 短路径分支同样必须附哈希：扁平化本身不是单射。
+        flat.push('-');
+        flat.push_str(&hash);
     }
     format!("agents/{flat}.{stamp}.bak")
 }
@@ -541,6 +552,28 @@ mod tests {
             backup_name(Path::new(&long_b), "S"),
             "截断后仍必须靠路径哈希保持唯一"
         );
+    }
+
+    /// CRITICAL：扁平化会把**所有**非 `[A-Za-z0-9.\-_]` 字符压成 `_`，其中的 `/`、`\`、空格
+    /// 与**本来就存在的 `_`** 是同一个结果。若只在扁平串超过 120 字符时才附路径哈希，那么
+    /// 最常见的短路径恰好落在碰撞区（实测 `...\agents\a\b.md` 与 `...\agents\a_b.md` 的扁平串
+    /// 都是 71 字符）：两个不同文件得到同一个备份键 ⇒ `write_backup_once` 静默跳过第二次备份，
+    /// 而两份清单都指向第一个备份 ⇒ `restore_agent` 把第一个文件的字节写进第二个文件，
+    /// 第二个文件的原文永久丢失。
+    #[test]
+    fn backup_name_is_injective_for_paths_that_flatten_alike() {
+        let pairs = [
+            (r"C:\x\agents\a\b.md", r"C:\x\agents\a_b.md"),
+            (r"C:\x\agents\reviewer pro.md", r"C:\x\agents\reviewer_pro.md"),
+        ];
+        for (left, right) in pairs {
+            let ln = backup_name(Path::new(left), "S");
+            let rn = backup_name(Path::new(right), "S");
+            assert_ne!(
+                ln, rn,
+                "{left} 与 {right} 扁平化后同名，备份键必须仍然可区分（否则一方永不备份）"
+            );
+        }
     }
 
     #[test]
