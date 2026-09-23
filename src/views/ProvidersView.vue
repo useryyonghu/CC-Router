@@ -44,6 +44,7 @@ import {
   templateLabel,
   templatePlaceholder,
   templateVariables,
+  unstoredTemplateVariables,
 } from "../presets";
 import { useConfigStore } from "../stores/config";
 import ProviderForm from "../components/ProviderForm.vue";
@@ -132,6 +133,12 @@ const filteredGroups = computed(() => groupPresets(filterPresets(store.presets, 
 const selectedPresetVars = computed(() => {
   const preset = selectedPreset.value;
   return preset ? templateVariables(preset) : [];
+});
+
+/** 预设声明了、但本版本不保存的变量（只提示，不向用户索要；见 I3）。 */
+const unstoredPresetVars = computed(() => {
+  const preset = selectedPreset.value;
+  return preset ? unstoredTemplateVariables(preset) : [];
 });
 
 function openCreate(): void {
@@ -612,6 +619,10 @@ const fetchColumns = computed<DataTableColumns<FetchedModel>>(() => [
         <n-space vertical :size="12">
           <n-alert v-if="selectedPreset" type="info">
             「{{ selectedPreset.name }}」的地址里有需要你填的变量，替换后才会落地。
+            <n-text v-if="unstoredPresetVars.length" depth="3" style="display: block; margin-top: 4px">
+              该预设还声明了 {{ unstoredPresetVars.join("、") }}，但本版本的服务商只存一个 API Key
+              （没有 env 字段），所以这些变量不会被索要、也不会写进配置。
+            </n-text>
           </n-alert>
           <n-form-item
             v-for="name in selectedPresetVars"

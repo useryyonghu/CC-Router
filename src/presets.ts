@@ -80,20 +80,37 @@ export function authStyleLabel(style: AuthStyle | null | undefined): string {
 
 // ---------------------------------------------------------------- 模板变量（`${VAR}`）
 
+function collectVariables(into: string[], text: string | null | undefined): void {
+  if (!text) return;
+  for (const match of text.matchAll(/\$\{([A-Za-z0-9_]+)\}/g)) {
+    if (match[1] && !into.includes(match[1])) into.push(match[1]);
+  }
+}
+
+/**
+ * 需要向用户索要的变量 = **地址里真的会出现**的变量（`baseUrl` / `modelsUrl`）。
+ *
+ * 只收集这两处，因为 `resolvePresetFields()` 也只替换这两处，而 `NewProviderDto`
+ * 没有 `env` 字段（后端 `NewProvider` 也不接受 env）：`defaultEnv` 里的 `${VAR}`
+ * ——例如 AWS Bedrock 的 `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`——**填了也存不进**。
+ * 与其索要一个注定被丢弃的密钥，不如不问（I3；诚实优先）。
+ */
 export function templateVariables(preset: Preset): string[] {
   const names: string[] = [];
-  const push = (name: string) => {
-    if (name && !names.includes(name)) names.push(name);
-  };
-  const collect = (text: string | null | undefined) => {
-    if (!text) return;
-    for (const match of text.matchAll(/\$\{([A-Za-z0-9_]+)\}/g)) push(match[1]);
-  };
-  collect(preset.baseUrl);
-  collect(preset.modelsUrl);
-  for (const value of Object.values(preset.defaultEnv ?? {})) collect(value);
-  for (const key of Object.keys(preset.templateValues ?? {})) push(key);
+  collectVariables(names, preset.baseUrl);
+  collectVariables(names, preset.modelsUrl);
   return names;
+}
+
+/** 预设声明了、但本版本**不会保存**的变量（只出现在 `defaultEnv` / `templateValues` 里）。 */
+export function unstoredTemplateVariables(preset: Preset): string[] {
+  const used = templateVariables(preset);
+  const declared: string[] = [];
+  for (const value of Object.values(preset.defaultEnv ?? {})) collectVariables(declared, value);
+  for (const key of Object.keys(preset.templateValues ?? {})) {
+    if (key && !declared.includes(key)) declared.push(key);
+  }
+  return declared.filter((name) => !used.includes(name));
 }
 
 export function templateValueOf(preset: Preset, name: string): TemplateValue | null {
@@ -133,10 +150,10 @@ export interface ResolvedPresetFields {
 export function resolvePresetFields(preset: Preset, values: Record<string, string>): ResolvedPresetFields {
   const baseUrl = fillTemplate(preset.baseUrl, values);
   const rawModelsUrl = preset.modelsUrl ? fillTemplate(preset.modelsUrl, values) : "";
+  // `templateVariables()` 只返回地址里的变量，所以「没填」与「地址里还留着 ${VAR}」等价。
   const unresolved = templateVariables(preset).filter((name) => {
     const value = values[name];
-    const used = baseUrl.includes(`\${${name}}`) || rawModelsUrl.includes(`\${${name}}`);
-    return used && (value === undefined || value.trim() === "");
+    return value === undefined || value.trim() === "";
   });
   return { baseUrl, modelsUrl: rawModelsUrl ? rawModelsUrl : null, unresolved };
 }
