@@ -52,7 +52,10 @@ pub struct FetchedModel {
 }
 
 /// 单个候选的结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 序列化成 serde 默认的外部标签形式（`{"Http":404}` / `{"Error":"…"}`）——`src/api/ipc.ts` 的
+/// `attemptOutcomeText` 正是按这两种形状取值，前端不必再感知 Rust 类型。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum AttemptOutcome {
     /// 拿到了 HTTP 响应但没命中（非 2xx，或 2xx 但列表为空）。
     Http(u16),
@@ -69,13 +72,16 @@ impl AttemptOutcome {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FetchAttempt {
     pub url: String,
     pub outcome: AttemptOutcome,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 同时也是 IPC 的 `FetchOutcomeDto`（camelCase：`usedUrl` / `models` / `attempts`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FetchOutcome {
     pub models: Vec<FetchedModel>,
     pub used_url: String,
