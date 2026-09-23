@@ -5,6 +5,7 @@ pub mod config;
 pub mod error;
 pub mod gateway;
 pub mod logging;
+pub mod preset;
 pub mod routing;
 
 use crate::commands::AppState;
