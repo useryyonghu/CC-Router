@@ -447,7 +447,6 @@ onMounted(() => {
         <n-space align="center" :size="10">
           <n-switch v-model:value="requestLogToFile" size="small" />
           <n-text>把请求日志落盘到 logs\requests-YYYY-MM-DD.jsonl</n-text>
-          <n-tag size="small" type="warning">网关尚未读取该开关，当前只保存配置</n-tag>
         </n-space>
       </n-space>
     </n-card>
