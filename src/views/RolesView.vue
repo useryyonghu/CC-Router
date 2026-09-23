@@ -45,7 +45,8 @@ const ROLE_LABELS: Record<RoleName, string> = {
 const ROLE_HINTS: Record<RoleName, string> = {
   main: "写入 ANTHROPIC_DEFAULT_OPUS / SONNET / FABLE_MODEL",
   fast: "写入 ANTHROPIC_DEFAULT_HAIKU_MODEL",
-  subagent: "写入 CLAUDE_CODE_SUBAGENT_MODEL",
+  subagent:
+    "写入 CLAUDE_CODE_SUBAGENT_MODEL —— 这是所有子 Agent 的默认；要让某个具体子 Agent 用别的模型，去「子 Agent」页单独指定",
 };
 
 const roleSlots = computed(() =>

@@ -367,22 +367,34 @@ const columns = computed<DataTableColumns<AgentInfo>>(() => [
       </template>
 
       <n-alert type="info" style="margin-bottom: 12px">
-        每个子 Agent 可以单独指定模型，也可以跟随主模型。三种写法的落盘差异：
-        <b>跟随主模型</b> 写入 <span class="mono">model: inherit</span>；
-        <b>使用 subagent 默认</b> 删除 <span class="mono">model</span> 行（走角色路由页的 subagent 槽位）；
-        <b>指定模型</b> 写入 <span class="mono">model: &lt;别名&gt;</span>。
-        改动只针对 <span class="mono">model</span> 行，frontmatter 其它字段与正文逐字节保留。
+        <b>这一页只管「单个具名子 Agent 的模型覆盖」</b>（<span class="mono">~/.claude/agents/*.md</span> 的 frontmatter）。
+        只想给<b>所有</b>子 Agent 设一个默认模型的话，<b>这里不用建任何东西</b> —— 去「角色路由」页配
+        <span class="mono">subagent</span> 槽位一次就够了；本页留空完全不影响它。
+        <div style="margin-top: 6px">
+          三种写法的落盘差异：<b>跟随主模型</b> 写入 <span class="mono">model: inherit</span>；
+          <b>使用 subagent 默认</b> 删除 <span class="mono">model</span> 行（于是回落到角色路由页的 subagent 槽位）；
+          <b>指定模型</b> 写入 <span class="mono">model: &lt;别名&gt;</span>。
+          改动只针对 <span class="mono">model</span> 行，frontmatter 其它字段与正文逐字节保留。
+        </div>
+        <div style="margin-top: 6px">
+          例：只想让 <span class="mono">reviewer</span> 这个子 Agent 用更贵的模型、其余保持默认，就在这里新建
+          <span class="mono">reviewer</span> 并选「指定模型」。
+        </div>
       </n-alert>
 
       <n-empty
         v-if="!loading && !agents.length"
-        description="还没有子 Agent —— 新建一个即可给它单独指定模型"
+        description="这一页是可选的覆盖层，现在没有任何具名子 Agent"
         style="padding: 32px 0"
       >
         <template #extra>
           <n-space vertical align="center">
             <n-text depth="3">
-              Claude Code 的 ~/.claude/agents/ 目录当前是空的。点下面的按钮新建：
+              Claude Code 的 ~/.claude/agents/ 目录当前是空的 ⇒ 所有子 Agent 都走「角色路由」页的 subagent 槽位，
+              不需要在这一页做任何事。
+            </n-text>
+            <n-text depth="3">
+              只有当你想要某个具体子 Agent（例如 reviewer）用<b>不同</b>的模型时，才点下面的按钮新建它：
               填名称、描述与 system prompt 即可。
             </n-text>
             <n-button type="primary" @click="openCreate">+ 新建子 Agent</n-button>
