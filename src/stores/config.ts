@@ -77,6 +77,11 @@ export const useConfigStore = defineStore("config", () => {
   }
 
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * 正在跑的那一拍（`null` = 空闲）。1.5s 的定时器与状态页的「立即刷新」共用
+   * `pollFastState()`：慢请求不会再叠罗汉 —— 后来的调用并入同一拍并等它结束（M9）。
+   */
+  let pollInFlight: Promise<void> | null = null;
 
   const providers = computed<Provider[]>(() => config.value?.providers ?? []);
   const models = computed<FlatModel[]>(() =>
@@ -222,8 +227,15 @@ export const useConfigStore = defineStore("config", () => {
   }
 
   /** 状态页与日志页轮询：日志 + 网关状态（请求数、端口会变）。 */
-  async function pollFastState(): Promise<void> {
-    await Promise.all([refreshLogs(), refreshGateway()]);
+  function pollFastState(): Promise<void> {
+    if (pollInFlight) return pollInFlight;
+    const tick = Promise.all([refreshLogs(), refreshGateway()]).then(() => undefined);
+    pollInFlight = tick;
+    const settle = () => {
+      if (pollInFlight === tick) pollInFlight = null;
+    };
+    void tick.then(settle, settle);
+    return tick;
   }
 
   function startLogPolling(): void {
