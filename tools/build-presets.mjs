@@ -10,7 +10,7 @@
 // 固定顺序写出，JSON 为 2 空格缩进 + 末尾换行，因此重跑后 `git diff --stat` 为空。
 //
 // 设计要点（对应 spec §5.6 与 Plan 3 A1）：
-// 1. 剥离联盟/追踪参数（aff / ref / invitecode / ch / utm_*），**不搬运 cc-switch 的推广关系**；
+// 1. 剥离联盟/追踪参数（完整名单见 TRACKING_PARAM），**不搬运 cc-switch 的推广关系**；
 //    剥离后仍是纯跳转/推广路径的 apiKeyUrl 置 null，UI 改为展示 websiteUrl。
 // 2. supported:false 的 5 条保留但带原因（将来加协议转换可直接启用）。
 // 3. verifiedAt 只填本机真正实测过的 3 条，其余一律 null（不谎称已验证）。
@@ -25,8 +25,22 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const RAW_PATH = join(ROOT, 'docs', 'reference', 'cc-switch-presets.raw.json');
 const OUT_PATH = join(ROOT, 'src-tauri', 'presets.json');
 
-/** 联盟/追踪参数：整段删除（spec §5.6「链接处理」）。 */
-const TRACKING_PARAM = /^(aff|ref|invitecode|ch|utm_)/i;
+/**
+ * 联盟/追踪参数：整段删除（spec §5.6「链接处理」）。
+ *
+ * 名单里每一项都只为"把注册/购买归因给上游项目"而存在（本轮补齐后 5 项）：
+ *   `ac` + `rc`  火山 Agent Plan / Coding Plan
+ *   `code` + `source`  Cubence
+ *   `from`       Shengsuanyun
+ *   `ic`         智谱 GLM / z.ai
+ *   `ytag`       Compshare
+ *
+ * **不能进名单**的三个功能性深链参数（删了会把用户带到错误的页面）：
+ *   `apikey`   火山控制台把 `{}` 以 `%7B%7D` 嵌在查询串里
+ *   `redirect` FennoAI 注册后的落地目标
+ *   `tab`      AICodeWith 的 `tab=register`（直接开注册页）
+ */
+const TRACKING_PARAM = /^(aff|ref|invitecode|ic|ytag|ac|rc|from|code|source|ch|utm_)/i;
 
 /** 明确的推广跳转路径前缀（多段用 `a/b` 表示）。 */
 const REFERRAL_PATH_PREFIXES = ['go', 'i', 'r', 'invite', 'agent/register', 'ref'];
@@ -112,6 +126,31 @@ function isPureReferral(strippedUrl, rawUrl) {
   if (segments.length === 1 && /[A-Z]/.test(segments[0])) return true;
 
   return false;
+}
+
+/**
+ * 剥离后 URL 仍必须**可用**：不允许把一条 URL 剥成"只剩根路径、连查询串都没有"——
+ * 这种 URL 已经指不到任何页面（页面只能靠参数定位），等于把"一键打开取密钥页"变成死链。
+ * 这种情况必须由 [`isPureReferral`] 判成推广链接并置 null，而不是留下一个空壳。
+ *
+ * 只对 `apiKeyUrl` 断言：`websiteUrl` 的根路径就是厂商首页，本来就可点。
+ */
+function assertStillUsable(strippedUrl, rawUrl, label) {
+  const parsed = parseUrl(strippedUrl);
+  if (!parsed) return; // 解析不了的 URL 本脚本原样保留，不在此断言范围
+  const hasPath = parsed.pathname !== '' && parsed.pathname !== '/';
+  if (!hasPath && parsed.search === '') {
+    throw new Error(
+      `${label}: 剥离追踪参数后 URL 已不可用（只剩根路径且无查询串）：${rawUrl} → ${strippedUrl}`,
+    );
+  }
+}
+
+/** URL 里是否仍带追踪参数（与 [`TRACKING_PARAM`] 同一份名单）。 */
+function hasTracking(url) {
+  const parsed = parseUrl(url);
+  if (!parsed) return false;
+  return [...parsed.searchParams.keys()].some((k) => TRACKING_PARAM.test(k));
 }
 
 /** supported / unsupportedReason（Plan 3 A1 规则 3，优先级固定）。 */
@@ -208,6 +247,10 @@ function convert(raw, uniqueId) {
   const apiKey = stripTracking(raw.apiKeyUrl);
   const apiKeyUrl =
     apiKey.url && isPureReferral(apiKey.url, raw.apiKeyUrl) ? null : apiKey.url;
+  // 剥离过的 apiKeyUrl 必须仍然指得到某个页面（详见 assertStillUsable）。
+  if (apiKeyUrl && apiKey.removed > 0) {
+    assertStillUsable(apiKeyUrl, raw.apiKeyUrl, `${raw.name}.apiKeyUrl`);
+  }
 
   const id = uniqueId(raw.name);
   const { supported, unsupportedReason } = supportOf(raw);
@@ -257,12 +300,21 @@ function main() {
   const tracked = presets.filter(
     (p) =>
       [p.websiteUrl, p.apiKeyUrl, p.baseUrl].some(
-        (u) => typeof u === 'string' && /[?&](aff|ref|invitecode|ch|utm_)/i.test(u),
+        (u) => typeof u === 'string' && hasTracking(u),
       ),
   ).length;
   console.log(
     `presets.json: ${presets.length} 条（不支持 ${unsupported} / 模板 ${templated} / 已验证 ${verified} / 残留追踪参数 ${tracked}）`,
   );
+
+  // 本脚本是**唯一**做剥离的地方：websiteUrl / apiKeyUrl 还有残留就说明名单或剥离逻辑有漏，
+  // 必须在这里炸掉而不是把残留写进交付物（src-tauri/src/preset/mod.rs 的同名用例也守这一条）。
+  const residue = presets.filter((p) =>
+    [p.websiteUrl, p.apiKeyUrl].some((u) => typeof u === 'string' && hasTracking(u)),
+  ).length;
+  if (residue > 0) {
+    throw new Error(`presets.json 仍有 ${residue} 条 URL 带追踪参数：名单或剥离逻辑有漏`);
+  }
 }
 
 main();

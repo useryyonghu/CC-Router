@@ -205,10 +205,36 @@ mod tests {
             .collect()
     }
 
+    /// 取 URL 的路径（不含开头的 `/`）与查询串。同样不引入解析依赖。
+    fn path_and_query(url: &str) -> (&str, &str) {
+        let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+        let (authority_and_path, query) = match rest.split_once('?') {
+            Some((a, q)) => (a, q.split('#').next().unwrap_or("")),
+            None => (rest, ""),
+        };
+        let path = authority_and_path.split_once('/').map(|(_, p)| p).unwrap_or("");
+        (path, query)
+    }
+
+    /// 联盟/追踪参数：整段删除（spec §5.6「链接处理」+ Plan 3 A1 规则 4）。
+    ///
+    /// 每一项都必须"只为把注册/购买归因给上游而存在"：
+    /// `ac`+`rc`（火山 Agent Plan）、`code`+`source`（Cubence）、`from`（Shengsuanyun）、
+    /// `ic`（智谱 GLM / z.ai）、`ytag`（Compshare）本轮补入。
+    ///
+    /// **不能进名单**的三个功能性深链参数：`apikey`（火山控制台把 `{}` 以 `%7B%7D` 嵌在
+    /// 查询串里）、`redirect`（FennoAI 注册后的落地目标）、`tab`（AICodeWith 的
+    /// `tab=register` 直接开注册页）。删掉它们会让"一键打开取密钥页"打开错误页面。
+    const DENIED_TRACKING: [&str; 11] = [
+        "aff", "ref", "invitecode", "ic", "ytag", "ac", "rc", "from", "code", "source", "ch",
+    ];
+
+    fn is_tracking(key_lower: &str) -> bool {
+        DENIED_TRACKING.contains(&key_lower) || key_lower.starts_with("utm_")
+    }
+
     fn has_tracking(url: &str) -> bool {
-        query_param_names(url)
-            .iter()
-            .any(|k| matches!(k.as_str(), "aff" | "ref" | "invitecode" | "ch") || k.starts_with("utm_"))
+        query_param_names(url).iter().any(|k| is_tracking(k))
     }
 
     #[test]
@@ -223,6 +249,11 @@ mod tests {
     }
 
     /// spec §5.6「链接处理」+ Plan 3 A1 规则 4：一律剥离联盟/追踪参数，不搬运推广关系。
+    ///
+    /// **真正的守卫是"零残留"**（对完整名单），而不是某个来源不明的最小条数：
+    /// 只要生成器漏剥一项，这里就会失败。原始夹具的计数只用来证明本用例没在空转 ——
+    /// 它是**精确值**锚定，不是"下界"：`docs/reference/cc-switch-presets.raw.json`
+    /// 是只读的上游参考，被改动时应当有人来看一眼。
     #[test]
     fn strips_affiliate_and_tracking_params() {
         let raw: Vec<serde_json::Value> = serde_json::from_str(RAW_JSON).unwrap();
@@ -233,20 +264,44 @@ mod tests {
         assert_eq!(by_name.len(), 93, "预设名称必须唯一，否则原始数据与本测试的映射会错位");
 
         // 先证明本测试不是空转：原始数据里确实有一批带追踪参数的 URL。
-        let mut raw_tracked = 0usize;
+        // 2026-09-22 用上面这份完整名单测得 **47 条 URL / 38 条预设**（清单扩大前是
+        // 40 / 32；spec 与计划里写的"至少 26 条"是更早、更小的一份名单，已废弃）。
+        let mut raw_tracked_urls = 0usize;
+        let mut raw_tracked_presets: HashSet<&str> = HashSet::new();
+        let mut raw_tracked_params: HashSet<String> = HashSet::new();
         for entry in &raw {
+            let name = entry["name"].as_str().unwrap();
             for field in ["websiteUrl", "apiKeyUrl"] {
                 if let Some(url) = entry.get(field).and_then(|v| v.as_str()) {
-                    if has_tracking(url) {
-                        raw_tracked += 1;
+                    let hit: Vec<String> = query_param_names(url)
+                        .into_iter()
+                        .filter(|k| is_tracking(k))
+                        .collect();
+                    if !hit.is_empty() {
+                        raw_tracked_urls += 1;
+                        raw_tracked_presets.insert(name);
+                        raw_tracked_params.extend(hit);
                     }
                 }
             }
         }
-        assert!(
-            raw_tracked >= 26,
-            "spec §5.6 记载至少 26 条 URL 带联盟/追踪参数，实测 {raw_tracked} 条：原始数据可能被改动"
+        assert_eq!(
+            raw_tracked_urls, 47,
+            "只读夹具变了：带追踪参数的 URL 数应为 47（实测值）"
         );
+        assert_eq!(
+            raw_tracked_presets.len(),
+            38,
+            "只读夹具变了：带追踪参数的预设数应为 38（实测值）"
+        );
+        // 名单里每一项都必须真的在夹具里出现过，否则"剥离"这一项就是空话，
+        // 而它在 shipped presets 里的零残留也不能证明任何事。
+        for param in ["aff", "ref", "invitecode", "ic", "ytag", "ac", "rc", "from", "code", "source"] {
+            assert!(
+                raw_tracked_params.contains(param),
+                "夹具里没有出现 {param}，这份名单就有名无实：{raw_tracked_params:?}"
+            );
+        }
 
         for entry in &raw {
             let name = entry["name"].as_str().unwrap();
@@ -261,7 +316,7 @@ mod tests {
             for (field, url) in urls {
                 let Some(url) = url else { continue };
                 assert!(!has_tracking(url), "{name}.{field} 仍带追踪参数: {url}");
-                for marker in ["aff=", "invitecode=", "utm_"] {
+                for marker in ["aff=", "invitecode=", "utm_", "ytag=", "ic="] {
                     assert!(
                         !url.contains(marker),
                         "{name}.{field} 仍含 {marker:?}: {url}"
@@ -281,6 +336,21 @@ mod tests {
                 };
                 if let Some(stripped) = stripped {
                     assert_ne!(stripped, raw_url, "{name}.{field} 应已剥离追踪参数");
+                }
+            }
+            // 剥离**不得**把 URL 剥成不可用：`apiKeyUrl` 是"一键打开取密钥页"的入口，
+            // 只剩根路径又没有查询串时它已经无处可去 —— 那种 URL 必须被判成纯推广跳转并由
+            // 生成器置 null，而不是留下一个打不开正确页面的壳。
+            // （`websiteUrl` 不适用：根路径就是厂商首页，本来就可点。）
+            if let Some(raw_url) = entry.get("apiKeyUrl").and_then(|v| v.as_str()) {
+                if has_tracking(raw_url) {
+                    if let Some(stripped) = preset.api_key_url.as_deref() {
+                        let (path, query) = path_and_query(stripped);
+                        assert!(
+                            !path.is_empty() || !query.is_empty(),
+                            "{name}.apiKeyUrl 剥离后只剩根路径且无查询串，已不可用: {stripped}"
+                        );
+                    }
                 }
             }
         }
