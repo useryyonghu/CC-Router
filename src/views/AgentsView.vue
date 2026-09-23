@@ -281,27 +281,8 @@ const columns = computed<DataTableColumns<AgentInfo>>(() => [
       }),
   },
   {
-    title: "描述",
-    key: "description",
-    minWidth: 220,
-    render: (row) => row.description ?? h(NText, { depth: 3 }, { default: () => "—" }),
-  },
-  {
-    title: "frontmatter 里的 model",
-    key: "model",
-    width: 160,
-    render: (row) =>
-      row.model
-        ? h("span", { class: "mono" }, row.model)
-        : h(NText, { depth: 3 }, { default: () => "（无 model 行）" }),
-  },
-  {
-    title: "生效说明",
-    key: "effect",
-    minWidth: 260,
-    render: (row) => effectText(row),
-  },
-  {
+    // 「模型指派」是这一页唯一真正要操作的东西，放在最前面：
+    // 默认窗口（1100×720）下可用宽度只有 800 出头，排在两个长文本列后面就会被挤出可视区。
     title: "模型指派",
     key: "assign",
     width: 470,
@@ -330,9 +311,35 @@ const columns = computed<DataTableColumns<AgentInfo>>(() => [
     },
   },
   {
+    title: "frontmatter 里的 model",
+    key: "model",
+    width: 150,
+    ellipsis: { tooltip: true },
+    render: (row) =>
+      row.model
+        ? h("span", { class: "mono" }, row.model)
+        : h(NText, { depth: 3 }, { default: () => "（无 model 行）" }),
+  },
+  {
+    title: "生效说明",
+    key: "effect",
+    width: 200,
+    ellipsis: { tooltip: true },
+    render: (row) => effectText(row),
+  },
+  {
+    title: "描述",
+    key: "description",
+    width: 180,
+    ellipsis: { tooltip: true },
+    render: (row) => row.description ?? h(NText, { depth: 3 }, { default: () => "—" }),
+  },
+  {
     title: "操作",
     key: "actions",
     width: 100,
+    // 固定在最右：表格比窗口宽（默认窗口就会），不固定则按钮够不到
+    fixed: "right",
     render: (row) =>
       h(
         NButton,
@@ -391,7 +398,7 @@ const columns = computed<DataTableColumns<AgentInfo>>(() => [
         :loading="loading"
         :bordered="false"
         size="small"
-        :scroll-x="1500"
+        :scroll-x="1320"
       />
     </n-card>
 

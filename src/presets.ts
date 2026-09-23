@@ -131,6 +131,20 @@ export function templatePlaceholder(preset: Preset, name: string): string {
   return typeof text === "string" ? text : "";
 }
 
+/**
+ * 变量输入框的**初始值** —— 只取真正的默认值，**绝不用 `placeholder`**。
+ *
+ * `placeholder` 是给用户看的"示例"（例如 kat-coder 的 `ep-xxx-xxx`）。把它当成初始值会
+ * 让用户直接点「替换并继续」就把示例写进 Base URL；更糟的是 `resolvePresetFields()`
+ * 只把**空值**算作"没填"，于是那句"还有变量没填"的安全网永远不会触发 ——
+ * 界面看起来填好了，实际填的是示例。
+ */
+export function templateInitialValue(preset: Preset, name: string): string {
+  const value = templateValueOf(preset, name);
+  const text = value?.defaultValue ?? value?.editorValue ?? "";
+  return typeof text === "string" ? text : "";
+}
+
 /** 用输入值替换 `${VAR}`；未填的变量保留原样，并由 `unresolvedVariables()` 报出。 */
 export function fillTemplate(text: string | null | undefined, values: Record<string, string>): string {
   if (!text) return "";

@@ -125,7 +125,17 @@ async function changeAutostart(next: boolean): Promise<void> {
   autostart.value = next; // 先给即时反馈，避免开关「按不动」；失败时下面会回滚
   const ok = await run(
     async () => {
-      autostart.value = await ipc.autostartSet(next);
+      const observed = await ipc.autostartSet(next);
+      autostart.value = observed;
+      // 后端契约（commands.rs 的 `autostart_set` 注释 / ipc.ts:351-357）：返回值是**实测**状态。
+      // 写注册表失败时它会是 `false`。若只看入参就弹「已开启」，用户会看到一条绿色成功提示
+      // 配一个被拨回去的 OFF 开关 —— 所以实测 != 请求时必须报错，不能报成功。
+      if (observed !== next) {
+        throw new Error(
+          `写入注册表失败：系统实际状态仍是「${observed ? "已开启" : "已关闭"}」，` +
+            `可能是权限或安全软件拦截（注册表位置：HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\CC Router）`,
+        );
+      }
     },
     next ? "已开启开机自启" : "已关闭开机自启",
     "autostart",
@@ -134,7 +144,7 @@ async function changeAutostart(next: boolean): Promise<void> {
     autostartObserved = autostart.value;
     return;
   }
-  // 失败：`run` 已经弹出后端错误文本（spec §5.7 不允许静默失败）。
+  // 失败：`run` 已经弹出错误文本（spec §5.7 不允许静默失败）。
   // 但开关绝不能停在「开」而注册表说「关」：以注册表实测值回滚；
   // 实测值也读不回来时，退回上一次实测值，最后才退回拨动前的值。
   const observed = await readAutostart(false);
@@ -164,6 +174,21 @@ const restartNeeded = computed(() => {
 const portDirty = computed(() => {
   const config = store.config;
   return !!config && port.value !== null && port.value !== config.gateway.port;
+});
+
+/**
+ * 三个行为开关（关窗行为 / 退出时还原 / 日志落盘）也是**草稿**，只有点「保存设置」才落盘。
+ * 以前只有端口有「未保存」提示，开关改了没有提示 ⇒ 用户拨一下就切页/关窗，改动静默丢失。
+ * `autostart` 不在这里：它是立即动作（写注册表），不是草稿。
+ */
+const behaviorDirty = computed(() => {
+  const ui = store.config?.ui;
+  if (!ui) return false;
+  return (
+    closeToTray.value !== ui.closeToTray ||
+    restoreOnExit.value !== ui.restoreOnExit ||
+    requestLogToFile.value !== ui.requestLogToFile
+  );
 });
 
 function saveSettings() {
@@ -224,28 +249,31 @@ function copyText(text: string, label: string): void {
     message.warning(`${label}为空`);
     return;
   }
-  const fallback = () => {
+  const fallback = (): boolean => {
     const area = document.createElement("textarea");
     area.value = text;
     area.style.position = "fixed";
     area.style.opacity = "0";
     document.body.appendChild(area);
     area.select();
-    document.execCommand("copy");
+    // `execCommand` 返回布尔值：以前忽略它，失败了也照样弹「已复制」—— 与"界面不能撒谎"相悖。
+    const ok = document.execCommand("copy");
     document.body.removeChild(area);
+    return ok;
+  };
+  /** 兜底路径的如实反馈：成功才说成功。 */
+  const fallbackThen = (): void => {
+    if (fallback()) message.success(`${label}已复制`);
+    else message.error(`${label}复制失败：浏览器拒绝了复制操作，请手动选中后按 Ctrl+C`);
   };
   try {
     if (navigator.clipboard?.writeText) {
       navigator.clipboard.writeText(text).then(
         () => message.success(`${label}已复制`),
-        () => {
-          fallback();
-          message.success(`${label}已复制`);
-        },
+        () => fallbackThen(),
       );
     } else {
-      fallback();
-      message.success(`${label}已复制`);
+      fallbackThen();
     }
   } catch (err) {
     message.error(`复制失败：${errorText(err)}`);
@@ -448,6 +476,10 @@ onMounted(() => {
           <n-switch v-model:value="requestLogToFile" size="small" />
           <n-text>把请求日志落盘到 logs\requests-YYYY-MM-DD.jsonl</n-text>
         </n-space>
+        <!-- 三个开关都是草稿：不提示的话，用户拨一下就切页/关窗，改动静默丢失 -->
+        <n-text v-if="behaviorDirty" depth="3" type="warning">
+          上面这几项已修改，点本卡片右上方的「保存设置」才会生效
+        </n-text>
       </n-space>
     </n-card>
 
@@ -491,6 +523,7 @@ onMounted(() => {
         size="small"
         :max-height="240"
         style="margin-top: 10px"
+        :scroll-x="760"
         :locale="{ empty: '还没有备份（接管 Claude Code 时会自动生成）' }"
       />
       <n-text depth="3">

@@ -383,6 +383,7 @@ function savePolicy() {
         :bordered="false"
         size="small"
         style="margin-top: 10px"
+        :scroll-x="820"
         :locale="{ empty: '还没有额外规则' }"
       />
       <n-space align="center" style="margin-top: 12px">
@@ -401,6 +402,16 @@ function savePolicy() {
         请求的 model 既不是已配置别名、也不含 Claude 家族名（opus/sonnet/haiku/fable）时怎么处理。
       </n-text>
       <n-space vertical :size="12" style="margin-top: 12px">
+        <!--
+          策略选了「转发到默认目标」却没选目标时，未识别的模型其实会**直接 400**（后端 resolve 的
+          等价用例 `unknown_model_errors_when_policy_default_but_no_default_target` 就是这么断言的）。
+          界面若只说"转发"，就是在撒谎，用户会按错误前提排查。所以这里把真实后果说出来。
+        -->
+        <n-alert v-if="policy === 'default' && !defaultTarget" type="warning" title="当前不会转发，未识别的模型会直接返回 400">
+          策略选的是「转发到默认目标」，但<strong>默认目标还是空的</strong>：此时请求的模型既不是已配置别名、
+          也不含 Claude 家族名（opus/sonnet/haiku/fable）就会直接 400，而不会转发到任何地方。
+          请选一个默认目标模型，或把策略改成「直接返回 400」。
+        </n-alert>
         <n-radio-group v-model:value="policy">
           <n-space vertical :size="6">
             <n-radio value="default">转发到「默认目标」并标黄记入日志（matchedBy = fallback）</n-radio>

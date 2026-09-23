@@ -101,7 +101,9 @@ function create(fetchModels: boolean) {
       await store.refreshConfig();
       emit("created", id, fetchModels);
     },
-    fetchModels ? "服务商已创建，正在获取模型列表…" : "服务商已创建",
+    // 不拉模型时**不在这里**弹提示：调用方（ProvidersView 的 onCreated）会给出更完整的一句
+    // （含「可点行内一键获取模型」），两边都弹就会出现同一动作两条 toast。
+    fetchModels ? "服务商已创建，正在获取模型列表…" : undefined,
     "create",
   );
 }
@@ -352,6 +354,8 @@ const modelColumns = computed<DataTableColumns<ModelRow>>(() => [
     title: "操作",
     key: "actions",
     width: 110,
+    // 固定在最右：这张表比弹窗宽，不固定的话「删除」会被挤出可视区
+    fixed: "right",
     render: (row) =>
       h(
         NButton,
@@ -509,6 +513,7 @@ const modelColumns = computed<DataTableColumns<ModelRow>>(() => [
         :bordered="false"
         size="small"
         :max-height="260"
+        :scroll-x="1020"
       />
       <n-text depth="3" style="display: block; margin: 8px 0">
         显示名 / 别名 / 1M / 上下文窗口 / max_tokens 的改动点「保存服务商」后生效；新增与删除立即生效

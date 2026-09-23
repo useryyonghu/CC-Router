@@ -8,7 +8,7 @@
  * - 接管卡片：三态 + 一键接管 / 一键还原 + `stale` 红色横幅（spec §7.4）。
  * - 请求日志表：`recent_logs` 最近 200 条，store 每 1.5s 轮询；可按服务商过滤。
  */
-import { computed, h, ref } from "vue";
+import { computed, h, ref, watch } from "vue";
 import {
   NAlert,
   NButton,
@@ -32,7 +32,7 @@ import { useConfigStore } from "../stores/config";
 const emit = defineEmits<{ navigate: [PageKey] }>();
 
 const store = useConfigStore();
-const { isBusy, run } = useAction();
+const { isBusy, run, message } = useAction();
 const { confirm } = useConfirm();
 
 const ROLE_LABELS: Record<RoleName, string> = {
@@ -63,7 +63,19 @@ function startGateway() {
   }, "网关已启动", "gateway-start");
 }
 
-function stopGateway() {
+async function stopGateway() {
+  // 已接管时停网关 = Claude Code 立刻不可用（界面随后才红字告知），所以先确认一次。
+  // 这与「网关没跑就点一键接管会先确认」保持对称。
+  if (takeoverState.value === "applied") {
+    const go = await confirm({
+      title: "停止网关会让 Claude Code 立刻不可用",
+      content:
+        "当前已接管：Claude Code 指向本机网关。停掉网关后，所有请求都会失败，直到你再次启动它。仍然停止？",
+      positiveText: "仍然停止",
+      danger: true,
+    });
+    if (!go) return false;
+  }
   return run(async () => {
     await ipc.gatewayStop();
     await store.refreshGateway();
@@ -82,12 +94,24 @@ function restartGateway() {
 
 const takeoverState = computed(() => store.takeover?.state ?? "not_applied");
 
+/**
+ * 我们**是否真的接管过**（有接管时间/清单）。
+ *
+ * 后端的 `stale` 只表示「settings.json 里的 ANTHROPIC_BASE_URL 不等于本网关」——
+ * 用户自己的直连配置也会命中它。所以不能一见 `stale` 就说"被其它程序改写"：
+ * 从没接管过的人看到这句话会以为应用出了故障（实际只是他的 Claude Code 没走本网关）。
+ */
+const takeoverWasApplied = computed(() => Boolean(store.takeover?.appliedAt));
+
 const takeoverTag = computed(() => {
   switch (takeoverState.value) {
     case "applied":
       return { type: "success" as const, text: "已接管" };
     case "stale":
-      return { type: "error" as const, text: "已失效（被外部改写）" };
+      // 没接管过就不是"失效"，只是"未接管"（否则是撒谎）
+      return takeoverWasApplied.value
+        ? { type: "error" as const, text: "已失效（被外部改写）" }
+        : { type: "default" as const, text: "未接管" };
     default:
       return { type: "default" as const, text: "未接管" };
   }
@@ -114,14 +138,32 @@ async function applyTakeover() {
 async function restoreTakeover() {
   const go = await confirm({
     title: "还原 Claude Code 配置",
-    content: "将按接管清单逐字节回放 ~/.claude/settings.json，并回退子 Agent 的 model 改动。继续？",
+    content:
+      "将按接管清单回放 ~/.claude/settings.json，并回退子 Agent 的 model 改动。" +
+      "若该文件自接管以来被其它程序改过，则按清单做合并式回放（保留别人新增的键），不是逐字节还原。继续？",
   });
   if (!go) return;
-  await run(async () => {
-    await ipc.takeoverRestore();
-    await store.refreshTakeover();
-    await store.refreshConfig();
-  }, "已还原 Claude Code 配置", "takeover-restore");
+  // 还原有两条路径（后端 `RestoreDto.path`）：`verbatim` = 逐字节回放原始字节，
+  // `merged_manifest` = 文件被外部改过、只能合并式回放。以前这里把返回值丢掉，
+  // 无论哪条都只弹「已还原」，于是「其实不是逐字节」这件事用户永远看不到。
+  let mode = "";
+  const ok = await run(
+    async () => {
+      const dto = await ipc.takeoverRestore();
+      mode = dto.path;
+      await store.refreshTakeover();
+      await store.refreshConfig();
+    },
+    undefined,
+    "takeover-restore",
+  );
+  if (ok) {
+    message.success(
+      mode === "verbatim"
+        ? "已逐字节还原 ~/.claude/settings.json（内容与接管前完全一致）"
+        : "已按清单合并式还原：恢复了我们改过的键、保留了外部新增的键（并非逐字节还原）",
+    );
+  }
 }
 
 // ---------------------------------------------------------------- 日志
@@ -137,6 +179,19 @@ const filteredLogs = computed(() =>
   providerFilter.value
     ? store.logs.filter((entry) => entry.providerId === providerFilter.value)
     : store.logs,
+);
+
+/**
+ * 过滤用的服务商被删掉后，下拉里已经没有这一项、但 `providerFilter` 还留着旧 id ⇒
+ * 表格会显示「还没有请求」（与事实相反）。服务商列表一变就清掉失效的过滤值。
+ */
+watch(
+  () => store.providers.map((provider) => provider.id).join(","),
+  () => {
+    if (providerFilter.value && !store.providers.some((provider) => provider.id === providerFilter.value)) {
+      providerFilter.value = "";
+    }
+  },
 );
 
 const MATCHED_BY_LABELS: Record<string, string> = {
@@ -183,6 +238,8 @@ const logColumns: DataTableColumns<LogEntry> = [
     title: "时间",
     key: "ts",
     width: 130,
+    // 固定在最左：横向滚动查看后面的列时，仍能知道这一行是什么时候的
+    fixed: "left",
     render: (row) => h("span", { class: "mono" }, formatTime(row.ts)),
   },
   {
@@ -218,6 +275,7 @@ const logColumns: DataTableColumns<LogEntry> = [
     title: "上游模型",
     key: "upstreamModel",
     width: 190,
+    ellipsis: { tooltip: true },
     render: (row) => h("span", { class: "mono" }, row.upstreamModel || "—"),
   },
   {
@@ -246,6 +304,7 @@ const logColumns: DataTableColumns<LogEntry> = [
     title: "错误",
     key: "error",
     minWidth: 160,
+    ellipsis: { tooltip: true },
     render: (row) => (row.error ? h("span", { style: "color:#d03050" }, row.error) : ""),
   },
 ];
@@ -350,7 +409,7 @@ function logRowProps(row: LogEntry) {
                     一键接管
                   </n-button>
                   <n-button
-                    :disabled="takeoverState === 'not_applied'"
+                    :disabled="!takeoverWasApplied"
                     :loading="isBusy('takeover-restore')"
                     @click="restoreTakeover"
                   >
@@ -366,7 +425,7 @@ function logRowProps(row: LogEntry) {
         </n-grid>
       </n-gi>
 
-      <n-gi v-if="takeoverState === 'stale'">
+      <n-gi v-if="takeoverState === 'stale' && takeoverWasApplied">
         <n-alert type="error" title="接管已失效：settings.json 被其它程序改写">
           <div>
             ~/.claude/settings.json 里的 ANTHROPIC_BASE_URL 现在是
@@ -384,6 +443,33 @@ function logRowProps(row: LogEntry) {
             </n-button>
             <n-button size="small" :loading="isBusy('takeover-restore')" @click="restoreTakeover">
               还原
+            </n-button>
+          </n-space>
+        </n-alert>
+      </n-gi>
+
+      <!--
+        从没接管过、只是 Claude Code 当前指向别处 —— 这是**信息**，不是故障。
+        以前这里复用上面那条红色"已失效"告警，会把"我没接管过"说成"被别的程序改写了"，
+        用户会以为应用坏了。措辞按事实写：现在指向哪里、本网关是哪里、点一下就能改过来。
+      -->
+      <n-gi v-else-if="takeoverState === 'stale'">
+        <n-alert type="info" title="Claude Code 当前不走本网关">
+          <div>
+            ~/.claude/settings.json 里的 ANTHROPIC_BASE_URL 是
+            <span class="mono">{{ store.takeover?.found || "（空）" }}</span>，
+            不是本机网关 <span class="mono">{{ store.takeover?.gatewayUrl }}</span>。
+            改走本网关后才能按角色路由到不同厂商。
+          </div>
+          <n-space style="margin-top: 8px">
+            <n-button
+              size="small"
+              type="primary"
+              :disabled="!store.providers.length"
+              :loading="isBusy('takeover-apply')"
+              @click="applyTakeover"
+            >
+              一键接管
             </n-button>
           </n-space>
         </n-alert>
@@ -417,6 +503,7 @@ function logRowProps(row: LogEntry) {
             :max-height="420"
             :bordered="false"
             size="small"
+            :scroll-x="1320"
             :locale="{
               empty: '还没有请求。把 Claude Code 接管后发一条消息，这里就会出现分流记录。',
             }"

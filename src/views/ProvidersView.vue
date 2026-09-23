@@ -41,6 +41,7 @@ import {
   groupPresets,
   presetVerificationText,
   resolvePresetFields,
+  templateInitialValue,
   templateLabel,
   templatePlaceholder,
   templateVariables,
@@ -162,7 +163,9 @@ function nextFromPick(): void {
   const vars = templateVariables(preset);
   if (vars.length) {
     for (const key of Object.keys(templateValues)) delete templateValues[key];
-    for (const name of vars) templateValues[name] = templatePlaceholder(preset, name);
+    // 只填**真默认值**，不填 placeholder（示例）—— 否则用户直接点「替换并继续」
+    // 就把示例当值写进地址，而"还有变量没填"的警告因值为非空而永不触发。
+    for (const name of vars) templateValues[name] = templateInitialValue(preset, name);
     stage.value = "template";
     return;
   }
@@ -275,15 +278,27 @@ async function runFetch(url?: string): Promise<void> {
   }
 }
 
-function addSelected() {
+async function addSelected(): Promise<boolean> {
   const provider = fetchProvider.value;
-  if (!provider) return Promise.resolve(false);
+  if (!provider) return false;
   const picks = fetchedModels.value
     .filter((model) => checkedIds.value.includes(model.id) && !isAdded(model.id))
     .map(pickFromFetched);
   if (!picks.length) {
     message.warning("没有可加入的模型（已添加的不会重复加入）");
-    return Promise.resolve(false);
+    return false;
+  }
+  // 拉取成功后默认会把所有模型都勾上（见 `runFetch`），一点就是几十个 —— 每个模型都占用一个
+  // 全局唯一别名，加错了要一个个删。所以一次加很多之前先确认。
+  if (picks.length > 5) {
+    const go = await confirm({
+      title: `一次加入 ${picks.length} 个模型？`,
+      content:
+        `每个模型都会生成一个全局唯一的别名并写入配置。若厂商返回了几十个模型而你只想用其中几个，` +
+        `建议先在列表里取消勾选，或关闭本弹窗后用「手动输入模型名」只加需要的那个。`,
+      positiveText: `加入 ${picks.length} 个`,
+    });
+    if (!go) return false;
   }
   return run(
     async () => {
@@ -348,9 +363,16 @@ async function offerRoleBinding(providerId: string): Promise<void> {
   const provider = store.providerById(providerId);
   const first = provider?.models[0];
   if (!provider || !first) return;
-  for (const role of ["main", "subagent"] as RoleName[]) {
+  // 三个槽位都要问：`fast` 没绑会同样拦住「一键接管」（后端要求 main/fast/subagent 都有值），
+  // 只问 main/subagent 会让用户以为已经收尾完成。
+  const roleLabels: Record<RoleName, string> = {
+    main: "主模型（main）",
+    fast: "快速任务（fast）",
+    subagent: "子 Agent（subagent）",
+  };
+  for (const role of ["main", "fast", "subagent"] as RoleName[]) {
     if (store.roleTargets[role] !== null) continue;
-    const label = role === "main" ? "主模型（main）" : "子 Agent（subagent）";
+    const label = roleLabels[role];
     const go = await confirm({
       title: "顺手绑定角色？",
       content: `把${label}设为「${provider.name} / ${first.name || first.id}」（别名 ${first.alias}）？未绑定的槽位会拦住「一键接管」。`,
@@ -387,7 +409,7 @@ const providerColumns: DataTableColumns<Provider> = [
   {
     title: "名称 / id",
     key: "name",
-    width: 200,
+    width: 180,
     render: (row) =>
       h(NSpace, { vertical: true, size: 0 }, {
         default: () => [
@@ -399,7 +421,9 @@ const providerColumns: DataTableColumns<Provider> = [
   {
     title: "Base URL",
     key: "baseUrl",
-    minWidth: 240,
+    minWidth: 200,
+    // 地址很长：不省略就会把表格撑开、把「操作」列挤出可视区
+    ellipsis: { tooltip: true },
     render: (row) => h("span", { class: "mono" }, row.baseUrl),
   },
   {
@@ -411,7 +435,8 @@ const providerColumns: DataTableColumns<Provider> = [
   {
     title: "预设验证状态",
     key: "verified",
-    width: 200,
+    width: 160,
+    ellipsis: { tooltip: true },
     render: (row) => {
       const preset = presetOf(row);
       if (!preset) return h(NTag, { size: "small" }, { default: () => "自定义" });
@@ -425,7 +450,8 @@ const providerColumns: DataTableColumns<Provider> = [
   {
     title: "上次拉取",
     key: "modelsFetch",
-    width: 210,
+    width: 180,
+    ellipsis: { tooltip: true },
     render: (row) => {
       const info = row.modelsFetch;
       if (!info) return h(NText, { depth: 3 }, { default: () => "从未拉取" });
@@ -441,6 +467,8 @@ const providerColumns: DataTableColumns<Provider> = [
     title: "测试连接",
     key: "test",
     width: 180,
+    // 失败时的 message 往往很长，180px 会截断 ⇒ 给 tooltip 让用户能看到完整原因
+    ellipsis: { tooltip: true },
     render: (row) => {
       const result = testResults[row.id];
       if (!result) return h(NText, { depth: 3 }, { default: () => "—" });
@@ -459,7 +487,10 @@ const providerColumns: DataTableColumns<Provider> = [
   {
     title: "操作",
     key: "actions",
-    width: 330,
+    width: 320,
+    // 固定在最右侧：表格比窗口宽时（默认窗口 1100×720 就会）这一列仍然可见、可点 ——
+    // 否则「编辑 / 测试连接 / 一键获取模型 / 删除」会被挤出可视区，用户根本够不到。
+    fixed: "right",
     render: (row) =>
       h(NSpace, { size: 4 }, {
         default: () => [
@@ -568,7 +599,7 @@ const fetchColumns = computed<DataTableColumns<FetchedModel>>(() => [
         :row-key="(row) => row.id"
         :bordered="false"
         size="small"
-        :scroll-x="1400"
+        :scroll-x="1150"
         :locale="{ empty: '还没有服务商' }"
       />
     </n-card>
@@ -709,6 +740,7 @@ const fetchColumns = computed<DataTableColumns<FetchedModel>>(() => [
           :max-height="330"
           :bordered="false"
           size="small"
+          :scroll-x="860"
         />
 
         <n-collapse v-if="fetchState === 'ok' && fetchAttempts.length > 1">
@@ -740,14 +772,7 @@ const fetchColumns = computed<DataTableColumns<FetchedModel>>(() => [
             </n-button>
           </n-space>
 
-          <n-divider style="margin: 4px 0">出路 2：手动输入模型名</n-divider>
-          <n-space>
-            <n-input v-model:value="manualModelId" placeholder="模型名，例如 k3 或 k3[1M]" style="width: 300px" />
-            <n-input v-model:value="manualModelName" placeholder="显示名（可空）" style="width: 220px" />
-            <n-button :loading="isBusy('add-manual')" @click="addManualModel">加入模型</n-button>
-          </n-space>
-
-          <n-divider style="margin: 4px 0">出路 3：用预设的离线兜底模型</n-divider>
+          <n-divider style="margin: 4px 0">出路 2：用预设的离线兜底模型</n-divider>
           <n-space v-if="fallbackIds.length" align="center" :size="6">
             <n-button
               v-for="id in fallbackIds"
@@ -762,6 +787,19 @@ const fetchColumns = computed<DataTableColumns<FetchedModel>>(() => [
           <n-text v-else depth="3">
             该服务商没有可用的预设兜底模型（预设未提供 defaultModels，或已全部添加）。
           </n-text>
+        </template>
+
+        <!--
+          手动输入模型名不该只在「拉取失败」时才有：接口通了、但返回的列表里没有你要的模型
+          （或返回空数组）时同样需要它，否则只能关掉弹窗→编辑→模型列表→添加。
+        -->
+        <template v-if="fetchState !== 'loading'">
+          <n-divider style="margin: 4px 0">也可以直接手动输入模型名</n-divider>
+          <n-space>
+            <n-input v-model:value="manualModelId" placeholder="模型名，例如 k3 或 k3[1M]" style="width: 300px" />
+            <n-input v-model:value="manualModelName" placeholder="显示名（可空）" style="width: 220px" />
+            <n-button :loading="isBusy('add-manual')" @click="addManualModel">加入模型</n-button>
+          </n-space>
         </template>
 
         <n-space justify="end">
