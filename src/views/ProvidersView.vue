@@ -588,8 +588,8 @@ const fetchColumns = computed<DataTableColumns<FetchedModel>>(() => [
             placeholder="搜索厂家预设（名称 / id / 分类 / 地址），共 93 条"
           />
           <n-text depth="3">
-            5 条需要协议转换或 OAuth 的预设会列出但禁用；预设数据来自 farion1231/cc-switch（MIT），
-            不含任何密钥。
+            7 条预设会列出但禁用：5 条需要协议转换或 OAuth，2 条（AWS Bedrock）需要 Claude Code 带厂商凭证直连、
+            会绕过本网关。预设数据来自 farion1231/cc-switch（MIT），不含任何密钥。
           </n-text>
           <n-scrollbar style="max-height: 430px">
             <n-radio-group v-model:value="selectedPresetId">
@@ -612,6 +612,12 @@ const fetchColumns = computed<DataTableColumns<FetchedModel>>(() => [
               </div>
             </n-radio-group>
           </n-scrollbar>
+          <!-- 这一步必须能走出去：`nextFromPick()` 负责按所选预设决定进「填变量」还是「填表单」。
+               此前这个按钮根本不存在，导致选了预设之后没有任何反应、无法新建服务商。 -->
+          <n-space justify="end">
+            <n-button quaternary @click="createOpen = false">取消</n-button>
+            <n-button type="primary" :disabled="!selectedPresetId" @click="nextFromPick">下一步</n-button>
+          </n-space>
         </n-space>
       </template>
 
