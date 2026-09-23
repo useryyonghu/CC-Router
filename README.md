@@ -68,7 +68,9 @@ CC Router 在本机起一个路由网关。Claude Code 指向这个网关，网�
 
 ### 1. 安装
 
-从 [Releases](../../releases) 下载 `CC Router_<版本>_x64-setup.exe` 双击安装。
+从 [Releases](../../releases) 下载 `CC.Router_<版本>_x64-setup.exe` 双击安装。
+
+> GitHub 会把资产名里的空格规范化成 `.`。本地产物名是 `CC Router_<版本>_x64-setup.exe`，两者是同一个文件。
 
 - 系统要求：**Windows 10/11 x64**，WebView2 运行时（Windows 11 自带；缺失时安装程序会**自动下载安装** WebView2 Bootstrapper）。
 - **免管理员**：按当前用户安装到 `%LOCALAPPDATA%\CC Router`，同时创建开始菜单快捷方式与标准卸载项。
