@@ -1,0 +1,384 @@
+<script setup lang="ts">
+/**
+ * B5：子 Agent。
+ *
+ * 数据源是 `~/.claude/agents/` 目录下的 .md 文件（`agents_list`），
+ * 每行三选一（spec §8.2）：
+ *  - 跟随主模型 → `agent_set_model(path, "inherit")`
+ *  - 使用 subagent 默认 → `agent_set_model(path, "subagent_default")`（删掉 `model` 行）
+ *  - 指定模型 → `agent_set_model(path, "alias", <别名>)`
+ * 新建 / 删除分别走 `agent_create` / `agent_delete`。
+ */
+import { computed, h, onMounted, reactive, ref } from "vue";
+import {
+  NAlert,
+  NButton,
+  NCard,
+  NDataTable,
+  NEmpty,
+  NFormItem,
+  NInput,
+  NModal,
+  NRadio,
+  NRadioGroup,
+  NSelect,
+  NSpace,
+  NTag,
+  NText,
+} from "naive-ui";
+import type { DataTableColumns } from "naive-ui";
+import * as ipc from "../api/ipc";
+import type { AgentInfo, AgentModelChoice, TargetDto } from "../api/ipc";
+import { errorText } from "../api/ipc";
+import { useAction } from "../composables/useAction";
+import { useConfirm } from "../composables/useConfirm";
+import ModelPicker from "../components/ModelPicker.vue";
+import { useConfigStore } from "../stores/config";
+
+const store = useConfigStore();
+const { isBusy, run, message } = useAction();
+const { confirm } = useConfirm();
+
+const agents = ref<AgentInfo[]>([]);
+const loading = ref(false);
+
+interface RowState {
+  choice: AgentModelChoice;
+  target: TargetDto | null;
+}
+const rowState = reactive<Record<string, RowState>>({});
+
+const CHOICE_OPTIONS = [
+  { label: "跟随主模型（inherit）", value: "inherit" },
+  { label: "使用 subagent 默认", value: "subagent_default" },
+  { label: "指定模型（别名）", value: "alias" },
+];
+
+function fileName(path: string): string {
+  return path.split(/[\\/]/).pop() ?? path;
+}
+
+function syncRows(): void {
+  for (const agent of agents.value) {
+    const model = agent.model?.trim() ? agent.model.trim() : null;
+    let choice: AgentModelChoice = "subagent_default";
+    if (model) choice = model.toLowerCase() === "inherit" ? "inherit" : "alias";
+    const matched = choice === "alias" ? store.modelByAlias(model) : null;
+    rowState[agent.path] = {
+      choice,
+      target: matched ? { providerId: matched.providerId, modelId: matched.modelId } : null,
+    };
+  }
+}
+
+async function load(): Promise<void> {
+  loading.value = true;
+  try {
+    agents.value = await ipc.agentsList();
+    syncRows();
+  } catch (err) {
+    message.error(errorText(err), { duration: 8000, closable: true });
+  } finally {
+    loading.value = false;
+  }
+}
+
+onMounted(() => {
+  void load();
+});
+
+/** 生效说明：把 frontmatter 里的 model 值翻译成「会走哪条路」。 */
+function effectText(agent: AgentInfo): string {
+  const model = agent.model?.trim() ? agent.model.trim() : null;
+  if (!model) return "使用 subagent 默认：走 CLAUDE_CODE_SUBAGENT_MODEL（角色路由页的 subagent 槽位）";
+  if (model.toLowerCase() === "inherit") return "跟随主模型：与主 agent 同模型";
+  const matched = store.modelByAlias(model);
+  if (matched) return `指定模型：${matched.providerName} / ${matched.modelName}`;
+  return `指定别名 ${model}（不在本应用当前配置里，网关可能不识别）`;
+}
+
+function setModel(agent: AgentInfo, choice: AgentModelChoice, alias: string | null) {
+  return run(
+    async () => {
+      await ipc.agentSetModel(agent.path, choice, alias);
+      await load();
+    },
+    `已更新 ${fileName(agent.path)} 的模型`,
+    `agent-${agent.path}`,
+  );
+}
+
+function changeChoice(agent: AgentInfo, choice: AgentModelChoice): void {
+  const state = rowState[agent.path];
+  if (!state) return;
+  state.choice = choice;
+  if (choice === "alias") {
+    // 选了「指定模型」但还没挑具体模型：等 ModelPicker 的回调再落盘，
+    // 避免中间态把 frontmatter 写成空。
+    if (state.target) void applyAlias(agent, state.target);
+    return;
+  }
+  state.target = null;
+  void setModel(agent, choice, null);
+}
+
+function applyAlias(agent: AgentInfo, target: TargetDto | null): void {
+  const state = rowState[agent.path];
+  if (state) state.target = target;
+  if (!target) return;
+  const alias = store.aliasOf(target);
+  if (!alias) {
+    message.error("该模型不在当前配置中，无法作为别名写入");
+    return;
+  }
+  void setModel(agent, "alias", alias);
+}
+
+async function removeAgent(agent: AgentInfo) {
+  const go = await confirm({
+    title: "删除子 Agent",
+    content: `删除 ${fileName(agent.path)}？删除前会先备份到 %APPDATA%\\cc-router\\backups\\agents\\。`,
+    positiveText: "删除",
+    danger: true,
+  });
+  if (!go) return;
+  await run(
+    async () => {
+      await ipc.agentDelete(agent.path);
+      await load();
+    },
+    "子 Agent 已删除",
+    `rm-${agent.path}`,
+  );
+}
+
+// ---------------------------------------------------------------- 新建
+
+const createOpen = ref(false);
+const draft = reactive({
+  name: "",
+  description: "",
+  choice: "subagent_default" as AgentModelChoice,
+  target: null as TargetDto | null,
+  body: "",
+});
+
+function openCreate(): void {
+  draft.name = "";
+  draft.description = "";
+  draft.choice = "subagent_default";
+  draft.target = null;
+  draft.body = "";
+  createOpen.value = true;
+}
+
+function createAgent() {
+  const name = draft.name.trim();
+  const description = draft.description.trim();
+  if (!name) {
+    message.warning("请填写名称（Claude Code 里用 @名称 调用它）");
+    return Promise.resolve(false);
+  }
+  if (!description) {
+    message.warning("请填写描述（Claude Code 靠它决定什么时候用这个子 Agent）");
+    return Promise.resolve(false);
+  }
+  let alias: string | null = null;
+  if (draft.choice === "alias") {
+    alias = store.aliasOf(draft.target);
+    if (!alias) {
+      message.warning("请为「指定模型」选择一个已配置的模型");
+      return Promise.resolve(false);
+    }
+  }
+  return run(
+    async () => {
+      const path = await ipc.agentCreate({
+        name,
+        description,
+        choice: draft.choice,
+        alias,
+        body: draft.body,
+      });
+      createOpen.value = false;
+      await load();
+      message.success(`已创建 ${fileName(path)}`);
+    },
+    undefined,
+    "create-agent",
+  );
+}
+
+// ---------------------------------------------------------------- 表格
+
+const columns = computed<DataTableColumns<AgentInfo>>(() => [
+  {
+    title: "文件 / 名称",
+    key: "name",
+    width: 220,
+    render: (row) =>
+      h(NSpace, { vertical: true, size: 0 }, {
+        default: () => [
+          h(NText, { strong: true }, { default: () => row.name || "（无 name）" }),
+          h("div", { class: "mono" }, fileName(row.path)),
+        ],
+      }),
+  },
+  {
+    title: "描述",
+    key: "description",
+    minWidth: 220,
+    render: (row) => row.description ?? h(NText, { depth: 3 }, { default: () => "—" }),
+  },
+  {
+    title: "frontmatter 里的 model",
+    key: "model",
+    width: 160,
+    render: (row) =>
+      row.model
+        ? h("span", { class: "mono" }, row.model)
+        : h(NText, { depth: 3 }, { default: () => "（无 model 行）" }),
+  },
+  {
+    title: "生效说明",
+    key: "effect",
+    minWidth: 260,
+    render: (row) => effectText(row),
+  },
+  {
+    title: "模型指派",
+    key: "assign",
+    width: 470,
+    render: (row) => {
+      const state = rowState[row.path] ?? { choice: "subagent_default" as AgentModelChoice, target: null };
+      const children = [
+        h(NSelect, {
+          value: state.choice,
+          options: CHOICE_OPTIONS,
+          size: "small",
+          style: "width: 220px",
+          "onUpdate:value": (value: unknown) => changeChoice(row, value as AgentModelChoice),
+        }),
+      ];
+      if (state.choice === "alias") {
+        children.push(
+          h(ModelPicker, {
+            modelValue: state.target,
+            size: "small",
+            placeholder: "选择要指定的模型",
+            "onUpdate:modelValue": (target: TargetDto | null) => applyAlias(row, target),
+          }),
+        );
+      }
+      return h(NSpace, { size: 6, align: "center" }, { default: () => children });
+    },
+  },
+  {
+    title: "操作",
+    key: "actions",
+    width: 100,
+    render: (row) =>
+      h(
+        NButton,
+        {
+          size: "small",
+          type: "error",
+          quaternary: true,
+          loading: isBusy(`rm-${row.path}`),
+          onClick: () => void removeAgent(row),
+        },
+        { default: () => "删除" },
+      ),
+  },
+]);
+</script>
+
+<template>
+  <div>
+    <n-card size="small" title="子 Agent（~/.claude/agents/*.md）">
+      <template #header-extra>
+        <n-space>
+          <n-button size="small" :loading="loading" @click="load">刷新</n-button>
+          <n-button size="small" type="primary" @click="openCreate">+ 新建子 Agent</n-button>
+        </n-space>
+      </template>
+
+      <n-alert type="info" style="margin-bottom: 12px">
+        每个子 Agent 可以单独指定模型，也可以跟随主模型。三种写法的落盘差异：
+        <b>跟随主模型</b> 写入 <span class="mono">model: inherit</span>；
+        <b>使用 subagent 默认</b> 删除 <span class="mono">model</span> 行（走角色路由页的 subagent 槽位）；
+        <b>指定模型</b> 写入 <span class="mono">model: &lt;别名&gt;</span>。
+        改动只针对 <span class="mono">model</span> 行，frontmatter 其它字段与正文逐字节保留。
+      </n-alert>
+
+      <n-empty
+        v-if="!loading && !agents.length"
+        description="还没有子 Agent —— 新建一个即可给它单独指定模型"
+        style="padding: 32px 0"
+      >
+        <template #extra>
+          <n-space vertical align="center">
+            <n-text depth="3">
+              Claude Code 的 ~/.claude/agents/ 目录当前是空的。点下面的按钮新建：
+              填名称、描述与 system prompt 即可。
+            </n-text>
+            <n-button type="primary" @click="openCreate">+ 新建子 Agent</n-button>
+          </n-space>
+        </template>
+      </n-empty>
+
+      <n-data-table
+        v-else
+        :columns="columns"
+        :data="agents"
+        :row-key="(row) => row.path"
+        :loading="loading"
+        :bordered="false"
+        size="small"
+        :scroll-x="1500"
+      />
+    </n-card>
+
+    <n-modal v-model:show="createOpen" preset="card" style="width: 760px" title="新建子 Agent">
+      <n-space vertical :size="12">
+        <n-form-item label="名称（Claude Code 里用 @名称 调用）" :show-feedback="false">
+          <n-input v-model:value="draft.name" placeholder="例如 reviewer" />
+        </n-form-item>
+        <n-form-item label="描述（Claude Code 靠它决定何时调用）" :show-feedback="false">
+          <n-input v-model:value="draft.description" placeholder="例如：代码评审，逐条给出可执行的修改建议" />
+        </n-form-item>
+        <n-form-item label="模型指派" :show-feedback="false">
+          <n-space vertical :size="8" style="width: 100%">
+            <n-radio-group v-model:value="draft.choice">
+              <n-space vertical :size="4">
+                <n-radio value="inherit">跟随主模型（model: inherit）</n-radio>
+                <n-radio value="subagent_default">使用 subagent 默认（不写 model 行）</n-radio>
+                <n-radio value="alias">指定模型（model: 别名）</n-radio>
+              </n-space>
+            </n-radio-group>
+            <div v-if="draft.choice === 'alias'" style="width: 420px">
+              <ModelPicker v-model="draft.target" placeholder="选择该子 Agent 使用的模型" />
+            </div>
+          </n-space>
+        </n-form-item>
+        <n-form-item label="system prompt 正文" :show-feedback="false">
+          <n-input
+            v-model:value="draft.body"
+            type="textarea"
+            :autosize="{ minRows: 6, maxRows: 14 }"
+            placeholder="你是一名严格的代码评审员，只关注可验证的缺陷……"
+          />
+        </n-form-item>
+        <n-space>
+          <n-button type="primary" :loading="isBusy('create-agent')" @click="createAgent">
+            创建
+          </n-button>
+          <n-button quaternary @click="createOpen = false">取消</n-button>
+        </n-space>
+        <n-tag v-if="!store.models.length" type="warning" size="small">
+          当前还没有配置任何模型：可以先用「使用 subagent 默认」，之后再到角色路由页绑定 subagent 槽位。
+        </n-tag>
+      </n-space>
+    </n-modal>
+  </div>
+</template>
