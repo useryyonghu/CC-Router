@@ -399,7 +399,7 @@
       "authStyle": "both",
       "modelsUrl": null,
       "apiKeyUrl": null,
-      "websiteUrl": "https://s.qiniu.com/nMvAvy",
+      "websiteUrl": null,
       "icon": "qiniu",
       "iconColor": null,
       "apiKeyField": "ANTHROPIC_AUTH_TOKEN",
@@ -623,7 +623,7 @@
       "baseUrl": "https://api.ppio.com/anthropic",
       "authStyle": "both",
       "modelsUrl": "https://api.ppio.com/openai/v1/models",
-      "apiKeyUrl": "https://ppio.com/activity/ccswitch",
+      "apiKeyUrl": null,
       "websiteUrl": "https://ppio.com",
       "icon": "ppio",
       "iconColor": "#2874FF",
@@ -2684,8 +2684,8 @@
         "AWS_SECRET_ACCESS_KEY": "${AWS_SECRET_ACCESS_KEY}",
         "CLAUDE_CODE_USE_BEDROCK": "1"
       },
-      "supported": true,
-      "unsupportedReason": null,
+      "supported": false,
+      "unsupportedReason": "需要直连 Bedrock 并使用厂商凭证（SigV4 / 专用调用路径），本版本网关仅做 Anthropic 格式透传",
       "verifiedAt": null,
       "defaultModels": [
         {
@@ -2729,8 +2729,8 @@
         "AWS_REGION": "${AWS_REGION}",
         "CLAUDE_CODE_USE_BEDROCK": "1"
       },
-      "supported": true,
-      "unsupportedReason": null,
+      "supported": false,
+      "unsupportedReason": "需要直连 Bedrock 并使用厂商凭证（SigV4 / 专用调用路径），本版本网关仅做 Anthropic 格式透传",
       "verifiedAt": null,
       "defaultModels": [
         {

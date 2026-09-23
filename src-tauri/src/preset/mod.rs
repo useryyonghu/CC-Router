@@ -26,6 +26,9 @@ pub fn presets_user_path() -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PresetFile {
+    /// 手写的 `presets.user.json` 常常不带版本号：缺字段就按 1 处理，而不是退回"裸数组"解析
+    /// 再报一句与文件无关的 `expected an array`。
+    #[serde(default = "default_version")]
     pub version: u32,
     #[serde(default)]
     pub source: Option<String>,
@@ -35,6 +38,10 @@ pub struct PresetFile {
     pub source_ref: Option<String>,
     #[serde(default)]
     pub presets: Vec<Preset>,
+}
+
+fn default_version() -> u32 {
+    1
 }
 
 /// `templateValues` 的一个条目（上游字段：`label` / `placeholder` / `defaultValue` / `editorValue`）。
@@ -166,14 +173,23 @@ fn parse_envelope(json: &str, path: &Path) -> Result<Vec<Preset>> {
     Ok(file.presets)
 }
 
+/// 解析用户文件：既接受与内置同构的信封，也接受裸数组（手写文件更省事）。
+///
+/// 两种写法都不成立时，报**信封**的错误：用户文件通常是信封写法，报数组的错误
+/// （`expected an array`）会把"信封里某个字段写坏了"误导成"文件结构完全不对"。
 fn parse_user(json: &str, path: &Path) -> Result<Vec<Preset>> {
-    if let Ok(file) = serde_json::from_str::<PresetFile>(json) {
-        return Ok(file.presets);
+    let envelope_err = match serde_json::from_str::<PresetFile>(json) {
+        Ok(file) => return Ok(file.presets),
+        Err(e) => e,
+    };
+    match serde_json::from_str::<Vec<Preset>>(json) {
+        Ok(list) => Ok(list),
+        Err(array_err) => Err(Error::Json {
+            path: path.to_path_buf(),
+            // 顶层是 `{` 就按信封报错；否则（裸数组写坏了）报数组的错误。
+            source: if json.trim_start().starts_with('{') { envelope_err } else { array_err },
+        }),
     }
-    serde_json::from_str::<Vec<Preset>>(json).map_err(|e| Error::Json {
-        path: path.to_path_buf(),
-        source: e,
-    })
 }
 
 #[cfg(test)]
@@ -216,21 +232,62 @@ mod tests {
         (path, query)
     }
 
-    /// 联盟/追踪参数：整段删除（spec §5.6「链接处理」+ Plan 3 A1 规则 4）。
+    /// 功能性查询参数**白名单**（与 `tools/build-presets.mjs` 的 `FUNCTIONAL_PARAM` 同一份）。
     ///
-    /// 每一项都必须"只为把注册/购买归因给上游而存在"：
-    /// `ac`+`rc`（火山 Agent Plan）、`code`+`source`（Cubence）、`from`（Shengsuanyun）、
-    /// `ic`（智谱 GLM / z.ai）、`ytag`（Compshare）本轮补入。
-    ///
-    /// **不能进名单**的三个功能性深链参数：`apikey`（火山控制台把 `{}` 以 `%7B%7D` 嵌在
-    /// 查询串里）、`redirect`（FennoAI 注册后的落地目标）、`tab`（AICodeWith 的
-    /// `tab=register` 直接开注册页）。删掉它们会让"一键打开取密钥页"打开错误页面。
-    const DENIED_TRACKING: [&str; 11] = [
-        "aff", "ref", "invitecode", "ic", "ytag", "ac", "rc", "from", "code", "source", "ch",
-    ];
+    /// 只有人类确认过"删了链接就指向错误页面"的参数才在这里：`apikey`（火山控制台把 `{}`
+    /// 以 `%7B%7D` 嵌在查询串里）、`redirect`（FennoAI 注册后落地目标）、`tab`
+    /// （AICodeWith 的 `tab=register`）。**要新增必须写明理由**：白名单的默认动作是删除。
+    const FUNCTIONAL_PARAM: [&str; 3] = ["apikey", "redirect", "tab"];
 
+    /// 追踪参数名（**精确匹配** + `utm_` 前缀）。只在 `baseUrl` 的残留检查里用得到：
+    /// `baseUrl` 是厂家端点，spec §5.6 只要求清洗链接栏位。
     fn is_tracking(key_lower: &str) -> bool {
-        DENIED_TRACKING.contains(&key_lower) || key_lower.starts_with("utm_")
+        const NAMES: [&str; 11] = [
+            "aff", "ref", "invitecode", "ic", "ytag", "ac", "rc", "from", "code", "source", "ch",
+        ];
+        NAMES.contains(&key_lower) || key_lower.starts_with("utm_")
+    }
+
+    /// 推广归因标志：`cc-switch` / `ccswitch` / `ccs`（大小写不敏感）。
+    fn is_promotion_mark(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        ["ccswitch", "cc-switch", "ccs"].iter().any(|m| lower.contains(m))
+    }
+
+    /// 推广归因命中（**三段式规则里会导致整条置 null 的两种**）：
+    ///  a. **路径段**命中 —— 归因长在路径里，清洗路径等于把链接掏空；
+    ///  b. **白名单参数**的值命中 —— 这个参数我们要保留，污点去不掉。
+    ///
+    /// **非**白名单参数的值命中不算：那个参数下一步就被删掉，归因随它一起消失，
+    /// 不该因此毁掉一条还能用的链接（`?aff=cc-switch` 不该杀掉 Kimi 的平台首页）。
+    fn promotion_hit(url: &str) -> Option<String> {
+        let (path, query) = path_and_query(url);
+        for segment in path.split('/').filter(|s| !s.is_empty()) {
+            if is_promotion_mark(segment) {
+                return Some(format!("path=/{segment}"));
+            }
+        }
+        for kv in query.split('&').filter(|kv| !kv.is_empty()) {
+            let (key, value) = kv.split_once('=').unwrap_or((kv, ""));
+            if FUNCTIONAL_PARAM.contains(&key.to_lowercase().as_str()) && is_promotion_mark(value) {
+                return Some(format!("kept-param={key}={value}"));
+            }
+        }
+        None
+    }
+
+    /// 不透明短链：单段路径且段内出现大写字母（`/nMvAvy`）——无从判断它落在哪。
+    fn is_opaque_short_link(url: &str) -> bool {
+        let (path, _) = path_and_query(url);
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        segments.len() == 1 && segments[0].chars().any(|c| c.is_ascii_uppercase())
+    }
+
+    fn non_functional_params(url: &str) -> Vec<String> {
+        query_param_names(url)
+            .into_iter()
+            .filter(|k| !FUNCTIONAL_PARAM.contains(&k.as_str()))
+            .collect()
     }
 
     fn has_tracking(url: &str) -> bool {
@@ -248,12 +305,16 @@ mod tests {
         );
     }
 
-    /// spec §5.6「链接处理」+ Plan 3 A1 规则 4：一律剥离联盟/追踪参数，不搬运推广关系。
+    /// spec §5.6「链接处理」+ Plan 3 A1 规则 4：`websiteUrl` / `apiKeyUrl` 按**功能性参数
+    /// 白名单**清洗（不再是黑名单）。
     ///
-    /// **真正的守卫是"零残留"**（对完整名单），而不是某个来源不明的最小条数：
-    /// 只要生成器漏剥一项，这里就会失败。原始夹具的计数只用来证明本用例没在空转 ——
-    /// 它是**精确值**锚定，不是"下界"：`docs/reference/cc-switch-presets.raw.json`
-    /// 是只读的上游参考，被改动时应当有人来看一眼。
+    /// 黑名单结构性失败过两次：先漏了 7 个参数，补上后又漏了两条**完全不含参数**的推广链接
+    /// （PPIO 的 `/activity/ccswitch` 靠路径、Qiniu 的 `/nMvAvy` 靠短链）。参数名是开放集合，
+    /// 黑名单永远补不完，所以规则改成"默认删除、白名单保留 + 推广启发式"。
+    ///
+    /// 本用例守**结果**（不重抄生成器的判定顺序）：
+    /// 1. 白名单之外的参数零残留；2. 推广标志零残留；3. 有删除/置 null 就必须体现在产物里；
+    /// 4. 两个链接栏位对同一条 URL 必须同判；5. 功能性参数在存活的链接里仍然保留。
     #[test]
     fn strips_affiliate_and_tracking_params() {
         let raw: Vec<serde_json::Value> = serde_json::from_str(RAW_JSON).unwrap();
@@ -263,109 +324,223 @@ mod tests {
             list.iter().map(|p| (p.name.as_str(), p)).collect();
         assert_eq!(by_name.len(), 93, "预设名称必须唯一，否则原始数据与本测试的映射会错位");
 
-        // 先证明本测试不是空转：原始数据里确实有一批带追踪参数的 URL。
-        // 2026-09-22 用上面这份完整名单测得 **47 条 URL / 38 条预设**（清单扩大前是
-        // 40 / 32；spec 与计划里写的"至少 26 条"是更早、更小的一份名单，已废弃）。
-        let mut raw_tracked_urls = 0usize;
-        let mut raw_tracked_presets: HashSet<&str> = HashSet::new();
-        let mut raw_tracked_params: HashSet<String> = HashSet::new();
+        // 夹具锚点用**精确值**（不是"下界"）：docs/reference/cc-switch-presets.raw.json 是
+        // 只读的上游参考，2026-09-22 实测 47 条 URL / 38 条预设带非白名单参数；
+        // 它被改动时应当有人来看一眼，而不是让本用例静静变成空转。
+        let mut raw_with_params = 0usize;
+        let mut raw_presets: HashSet<&str> = HashSet::new();
+        let mut raw_param_names: HashSet<String> = HashSet::new();
         for entry in &raw {
             let name = entry["name"].as_str().unwrap();
             for field in ["websiteUrl", "apiKeyUrl"] {
                 if let Some(url) = entry.get(field).and_then(|v| v.as_str()) {
-                    let hit: Vec<String> = query_param_names(url)
-                        .into_iter()
-                        .filter(|k| is_tracking(k))
-                        .collect();
-                    if !hit.is_empty() {
-                        raw_tracked_urls += 1;
-                        raw_tracked_presets.insert(name);
-                        raw_tracked_params.extend(hit);
+                    raw_param_names.extend(query_param_names(url));
+                    if !non_functional_params(url).is_empty() {
+                        raw_with_params += 1;
+                        raw_presets.insert(name);
                     }
                 }
             }
         }
-        assert_eq!(
-            raw_tracked_urls, 47,
-            "只读夹具变了：带追踪参数的 URL 数应为 47（实测值）"
-        );
-        assert_eq!(
-            raw_tracked_presets.len(),
-            38,
-            "只读夹具变了：带追踪参数的预设数应为 38（实测值）"
-        );
-        // 名单里每一项都必须真的在夹具里出现过，否则"剥离"这一项就是空话，
-        // 而它在 shipped presets 里的零残留也不能证明任何事。
-        for param in ["aff", "ref", "invitecode", "ic", "ytag", "ac", "rc", "from", "code", "source"] {
+        assert_eq!(raw_with_params, 47, "只读夹具变了：带非白名单参数的 URL 应为 47（实测值）");
+        assert_eq!(raw_presets.len(), 38, "只读夹具变了：带非白名单参数的预设应为 38（实测值）");
+        // 夹具必须真的覆盖三个功能性参数，否则"保留它们"这两条断言就是空转
+        for name in ["apikey", "redirect", "tab"] {
             assert!(
-                raw_tracked_params.contains(param),
-                "夹具里没有出现 {param}，这份名单就有名无实：{raw_tracked_params:?}"
+                raw_param_names.contains(name),
+                "夹具里没有 {name}：白名单的保留行为无从被验证"
             );
         }
+        // 也要有完全不带参数的链接，否则"原样保留"分支没被走过
+        assert!(
+            raw.iter().any(|e| ["websiteUrl", "apiKeyUrl"].iter().any(|f| {
+                e.get(f)
+                    .and_then(|v| v.as_str())
+                    .map(|u| query_param_names(u).is_empty())
+                    == Some(true)
+            })),
+            "夹具里应当也有完全不带参数的链接"
+        );
 
+        // 逐条断言**不变量**（不是"数了多少条被置 null"—— 那种计数在规则写错时照样能过）：
         for entry in &raw {
             let name = entry["name"].as_str().unwrap();
             let preset = by_name
                 .get(name)
                 .unwrap_or_else(|| panic!("原始数据里的预设 {name} 没有出现在内置目录里"));
-            let urls: [(&str, Option<&str>); 3] = [
-                ("baseUrl", Some(preset.base_url.as_str())),
-                ("websiteUrl", preset.website_url.as_deref()),
-                ("apiKeyUrl", preset.api_key_url.as_deref()),
-            ];
-            for (field, url) in urls {
-                let Some(url) = url else { continue };
-                assert!(!has_tracking(url), "{name}.{field} 仍带追踪参数: {url}");
-                for marker in ["aff=", "invitecode=", "utm_", "ytag=", "ic="] {
-                    assert!(
-                        !url.contains(marker),
-                        "{name}.{field} 仍含 {marker:?}: {url}"
-                    );
-                }
-            }
-            // 原来带参的 URL，剥离后必须与原文不同（或整条被置 null）。
             for field in ["websiteUrl", "apiKeyUrl"] {
-                let Some(raw_url) = entry.get(field).and_then(|v| v.as_str()) else { continue };
-                if !has_tracking(raw_url) {
-                    continue;
-                }
-                let stripped = if field == "websiteUrl" {
+                let raw_url = entry.get(field).and_then(|v| v.as_str());
+                let shipped = if field == "websiteUrl" {
                     preset.website_url.as_deref()
                 } else {
                     preset.api_key_url.as_deref()
                 };
-                if let Some(stripped) = stripped {
-                    assert_ne!(stripped, raw_url, "{name}.{field} 应已剥离追踪参数");
+                if let Some(url) = shipped {
+                    // 不变量 1：非白名单参数零残留
+                    let residue = non_functional_params(url);
+                    assert!(
+                        residue.is_empty(),
+                        "{name}.{field} 仍有白名单之外的参数 {residue:?}: {url}"
+                    );
+                    // 不变量 2/3：路径段与**保留参数的值**都不得命中推广标志
+                    assert!(
+                        promotion_hit(url).is_none(),
+                        "{name}.{field} 仍命中推广标志（{}）: {url}",
+                        promotion_hit(url).unwrap()
+                    );
                 }
-            }
-            // 剥离**不得**把 URL 剥成不可用：`apiKeyUrl` 是"一键打开取密钥页"的入口，
-            // 只剩根路径又没有查询串时它已经无处可去 —— 那种 URL 必须被判成纯推广跳转并由
-            // 生成器置 null，而不是留下一个打不开正确页面的壳。
-            // （`websiteUrl` 不适用：根路径就是厂商首页，本来就可点。）
-            if let Some(raw_url) = entry.get("apiKeyUrl").and_then(|v| v.as_str()) {
-                if has_tracking(raw_url) {
-                    if let Some(stripped) = preset.api_key_url.as_deref() {
-                        let (path, query) = path_and_query(stripped);
-                        assert!(
-                            !path.is_empty() || !query.is_empty(),
-                            "{name}.apiKeyUrl 剥离后只剩根路径且无查询串，已不可用: {stripped}"
-                        );
-                    }
+
+                let Some(raw_url) = raw_url else { continue };
+                // 不变量 4：原 URL 命中推广规则（路径 / 保留参数值）→ 产物必须是 null
+                if promotion_hit(raw_url).is_some() {
+                    assert_eq!(
+                        shipped, None,
+                        "{name}.{field} 命中推广规则（{}）就必须置 null，不能留下带归因的链接: {raw_url}",
+                        promotion_hit(raw_url).unwrap()
+                    );
+                }
+                // 不变量 5：删了非白名单参数就必须体现在产物里（"静默丢弃"在这里被挡住）。
+                // 注意**不能**反过来要求"值命中推广标志就置 null"：那种参数是被删掉的，
+                // 链接必须留下（见本用例末尾 Kimi / Volcengine 的定点断言）。
+                if !non_functional_params(raw_url).is_empty() {
+                    assert_ne!(
+                        shipped, Some(raw_url),
+                        "{name}.{field} 有非白名单参数，产物却与原文一样（参数没被删）"
+                    );
+                }
+                // 不变量 6：不透明短链两个栏位同一判据（Qiniu 那条 URL 在两边都要 null）
+                if is_opaque_short_link(raw_url) && promotion_hit(raw_url).is_none() {
+                    assert_eq!(
+                        shipped, None,
+                        "{name}.{field} 是不透明短链，必须与另一个栏位得到同一判决: {raw_url}"
+                    );
                 }
             }
         }
-    }
 
+        // 独立复审点名的两个案例：PPIO 靠**路径**（无参数可查）、Qiniu 靠短链，
+        // 而 Qiniu 的两个栏位是**同一条 URL**，必须同判。
+        let ppio = find(&list, "ppio");
+        assert_eq!(
+            ppio.api_key_url, None,
+            "PPIO 的 /activity/ccswitch 是纯推广落地页（项目名在路径里），必须置 null"
+        );
+        assert_eq!(ppio.website_url.as_deref(), Some("https://ppio.com"));
+        let qiniu = find(&list, "qiniu");
+        assert_eq!(qiniu.api_key_url, None, "Qiniu 的短链取密钥页必须置 null");
+        assert_eq!(
+            qiniu.website_url, None,
+            "Qiniu 的 websiteUrl 是**同一条**短链，必须得到与 apiKeyUrl 相同的判决"
+        );
+
+        // 功能性参数在存活的链接里必须保留（白名单不是"全删"）
+        assert!(
+            find(&list, "fennoai").api_key_url.as_deref().unwrap().contains("redirect="),
+            "redirect 是功能性参数（注册后落地目标），必须保留"
+        );
+        assert!(
+            find(&list, "aicodewith").api_key_url.as_deref().unwrap().contains("tab=register"),
+            "tab=register 是功能性参数，必须保留"
+        );
+
+        // **`apikey` 之所以在白名单里，唯一理由就是火山控制台那条 URL**：它的取密钥页把 `{}`
+        // 以 `%7B%7D` 嵌在查询串里，删了参数就打不开。三段式规则**不得**因为同一 URL 上
+        // 那些"反正要删"的 utm_* 值提到 ccswitch 就把整条链接 null 掉 —— 那会让这条白名单
+        // 形同虚设、且这个预设的取密钥入口在产品里彻底消失。
+        let doubao = find(&list, "volcengine-doubao");
+        let key_url = doubao
+            .api_key_url
+            .as_deref()
+            .expect("Volcengine Doubao 的取密钥页必须保留（apikey 参数是它存在的理由）");
+        assert!(key_url.contains("/apiKey"), "{key_url}");
+        assert!(
+            key_url.contains("apikey=%7B%7D"),
+            "apikey=%7B%7D 必须原样保留（火山控制台用 %7B%7D 表示那个空占位符）: {key_url}"
+        );
+        assert_eq!(
+            non_functional_params(key_url).len() + non_functional_params(key_url).len(),
+            0,
+            "除 apikey 外的参数（utm_* 等）必须全部删除: {key_url}"
+        );
+        assert_eq!(
+            query_param_names(key_url),
+            vec!["apikey".to_string()],
+            "只剩 apikey 一个参数: {key_url}"
+        );
+        assert_eq!(
+            doubao.website_url.as_deref(),
+            Some(key_url),
+            "websiteUrl 与 apiKeyUrl 是同一条 URL，判决必须一致"
+        );
+
+        // 三段式规则的**代价侧**：只有"归因长在路径里"和"保留参数带推广值"才置 null。
+        // 下面这些链接的推广标志只出现在**即将被删除**的参数值里 —— 它们必须留下来，
+        // 否则一条能用的链接会被一个本来就要删的参数毁掉（这正是上一版的错误）。
+        assert_eq!(
+            find(&list, "kimi").website_url.as_deref(),
+            Some("https://platform.kimi.com/"),
+            "Kimi 平台首页只因 ?aff=cc-switch 被 null 是错的：aff 本来就会被删掉"
+        );
+        assert_eq!(
+            find(&list, "kimi-for-coding").website_url.as_deref(),
+            Some("https://www.kimi.com/code/"),
+        );
+        assert_eq!(
+            find(&list, "byteplus").api_key_url.as_deref(),
+            Some("https://www.byteplus.com/en/product/modelark"),
+            "BytePlus 的 ModelArk 产品页只因 utm_* 提到 ccswitch 被 null 是错的"
+        );
+        assert_eq!(
+            find(&list, "compshare").api_key_url.as_deref(),
+            Some("https://www.compshare.cn/coding-plan"),
+        );
+        assert_eq!(
+            find(&list, "cubence").api_key_url.as_deref(),
+            Some("https://cubence.com/signup"),
+            "Cubence 的 code=CCSWITCH/source=ccs 都是被删的参数，链接必须留下"
+        );
+        let plan = find(&list, "agent-plan");
+        assert_eq!(
+            plan.website_url.as_deref(),
+            Some("https://www.volcengine.com/activity/agentplan"),
+        );
+        assert_eq!(plan.api_key_url, plan.website_url);
+
+        // baseUrl 是厂家端点，生成器不碰它的参数；这里确认交付物里确实没有追踪参数残留
+        for p in &list {
+            assert!(
+                !has_tracking(&p.base_url),
+                "{} 的 baseUrl 带追踪参数: {}",
+                p.name,
+                p.base_url
+            );
+        }
+    }
+    /// 不支持的条目必须仍在目录里、带原因（spec §5.6：保留而不是删掉，将来加协议转换可启用）。
+    ///
+    /// 5 条来自 `apiFormat` / `requiresOAuth` 规则；本轮新增的 2 条来自
+    /// "Claude Code 被要求直连厂商（`CLAUDE_CODE_USE_*`）"这条**架构级**规则：
+    /// 网关只会拼 `{baseUrl}/v1/messages`（`gateway/rewrite.rs`），既不做 SigV4 签名也没有
+    /// Bedrock 专用调用路径，而且那条 env 里的 `CLAUDE_CODE_USE_BEDROCK=1` 根本不会落到
+    /// Claude Code（`defaultEnv` 本版本不持久化）—— 它们不可能通过本网关工作。
     #[test]
-    fn marks_exactly_5_presets_unsupported_with_reasons() {
+    fn marks_exactly_7_presets_unsupported_with_reasons() {
         let list = builtin();
         let mut unsupported: Vec<&Preset> = list.iter().filter(|p| !p.supported).collect();
         unsupported.sort_by(|a, b| a.name.cmp(&b.name));
         let names: Vec<&str> = unsupported.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(
             names,
-            ["Codex", "Gemini Native", "GitHub Copilot", "Nvidia", "xAI (Grok)"],
-            "不支持的 5 条必须仍列出，且正好是这 5 条"
+            [
+                "AWS Bedrock (AKSK)",
+                "AWS Bedrock (API Key)",
+                "Codex",
+                "Gemini Native",
+                "GitHub Copilot",
+                "Nvidia",
+                "xAI (Grok)"
+            ],
+            "不支持的 7 条必须仍列出，且正好是这 7 条"
         );
 
         let reason = |name: &str| {
@@ -390,9 +565,27 @@ mod tests {
             "requiresOAuth 的正好 3 条"
         );
 
-        assert_eq!(list.len() - unsupported.len(), 88, "其余 88 条 supported: true");
+        // 两条 Bedrock：原因必须点名真正的阻塞（直连厂商 + 厂商凭证），而不是含糊的"格式转换"。
+        for id in ["aws-bedrock-aksk", "aws-bedrock-api-key"] {
+            let p = find(&list, id);
+            assert!(!p.supported, "{id} 必须标记为不支持");
+            let reason = p.unsupported_reason.as_deref().unwrap_or("");
+            assert!(reason.contains("Bedrock"), "{id} 的原因要点名厂商: {reason}");
+            assert!(reason.contains("厂商凭证"), "{id} 的原因要点名阻塞: {reason}");
+        }
+
+        assert_eq!(list.len() - unsupported.len(), 86, "其余 86 条 supported: true");
         for p in list.iter().filter(|p| p.supported) {
             assert!(p.unsupported_reason.is_none(), "{} 不该有不支持原因", p.name);
+            // 这条才是"将来加 Vertex 预设也不会漏"的守卫：只要 Claude Code 被告知直连厂商
+            // （`CLAUDE_CODE_USE_*`），本网关就不可能服务它 —— 绝不能标 supported。
+            for key in p.default_env.keys() {
+                assert!(
+                    !key.starts_with("CLAUDE_CODE_USE_"),
+                    "{} 标记为 supported，却让 Claude Code 直连厂商（{key}）：本网关无法服务直连厂商的请求",
+                    p.name
+                );
+            }
         }
     }
 
@@ -453,6 +646,44 @@ mod tests {
             "官方预设的上游 env 原本是 {{}}，我们必须补上显式地址"
         );
         assert!(official.supported);
+        // 判据是**名字**，不是"env 里没有 ANTHROPIC_BASE_URL"：后者会把将来任何一条
+        // env 为空的预设也硬指向 api.anthropic.com。这里从产物侧钉住"只有它"。
+        assert_eq!(
+            list.iter().filter(|p| p.base_url == "https://api.anthropic.com").count(),
+            1,
+            "只有 Claude Official 可以指向 api.anthropic.com"
+        );
+        assert_eq!(official.id, "claude-official");
+    }
+
+    /// 手写 `presets.user.json` 的两条容错：
+    /// 1. 信封缺 `version` 必须能读（`#[serde(default)]`），而不是掉进裸数组解析；
+    /// 2. 信封里某字段写坏时报**信封**的错误（点名那个字段），而不是 `expected an array`。
+    #[test]
+    fn user_file_envelope_tolerates_missing_version_and_reports_the_envelope_error() {
+        let body = r#"{"id":"my-custom","name":"My Custom","category":"third_party","baseUrl":"https://example.com/anthropic","authStyle":"both","supported":true}"#;
+
+        let no_version = format!(r#"{{"presets":[{body}]}}"#);
+        let list = load_presets(presets_builtin(), Some(&no_version)).unwrap();
+        assert_eq!(list.len(), 94, "信封缺 version 也必须能读");
+        assert_eq!(find(&list, "my-custom").name, "My Custom");
+
+        // 信封里 presets 的类型写坏：错误必须来自**信封**解析（点名那个坏值），
+        // 而不是"整份文件不是数组"（`invalid type: map`）这种把人带偏的消息。
+        let broken = r#"{"version":1,"presets":"oops"}"#;
+        let err = load_presets(presets_builtin(), Some(broken)).unwrap_err().to_string();
+        assert!(
+            err.contains("oops"),
+            "错误要点名出问题的取值（信封错误）: {err}"
+        );
+        assert!(
+            !err.contains("invalid type: map"),
+            "不该把信封错误误报成裸数组错误: {err}"
+        );
+
+        // 裸数组写坏时仍然报数组的错误（那条路的提示才是有用的）
+        let broken_array = r#"[{"id":"x"}"#;
+        assert!(load_presets(presets_builtin(), Some(broken_array)).is_err());
     }
 
     #[test]
