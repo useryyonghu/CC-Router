@@ -143,6 +143,12 @@ pub fn build_env_updates(cfg: &Config) -> BTreeMap<String, String> {
     if let Some((alias, _)) = alias_and_display(cfg, &cfg.roles.subagent) {
         out.insert(SUBAGENT_MODEL_KEY.to_string(), alias);
     }
+    // 不变量：写入的键必须都在 OWNED_KEYS 里（新增键时忘了登记会在这里炸掉测试）。
+    debug_assert!(
+        out.keys().all(|k| OWNED_KEYS.contains(&k.as_str())),
+        "build_env_updates 产出了 OWNED_KEYS 之外的键: {:?}",
+        out.keys().collect::<Vec<_>>()
+    );
     out
 }
 
