@@ -19,12 +19,19 @@ pub fn run() {
     tauri::Builder::default()
         .manage(state)
         .invoke_handler(tauri::generate_handler![
-            commands::gateway_status,
+            commands::agent_create,
+            commands::agent_delete,
+            commands::agent_set_model,
+            commands::agents_list,
             commands::gateway_start,
+            commands::gateway_status,
             commands::gateway_stop,
             commands::get_config,
-            commands::save_config,
             commands::recent_logs,
+            commands::save_config,
+            commands::takeover_apply,
+            commands::takeover_restore,
+            commands::takeover_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

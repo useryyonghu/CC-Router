@@ -159,6 +159,12 @@ pub struct TakeoverState {
     pub settings_keys: serde_json::Value,
     #[serde(default)]
     pub agent_files: serde_json::Value,
+    /// `claude::settings::TakeoverManifest` 的序列化形式：**精确还原的唯一依据**。
+    ///
+    /// 存进配置而不仅放内存，是为了让还原在应用重启后仍然可用；`serde(default)` 保证
+    /// 没有该字段的旧 config.json（本字段加入之前写的）仍能正常反序列化。
+    #[serde(default)]
+    pub manifest: Option<serde_json::Value>,
 }
 
 impl Config {

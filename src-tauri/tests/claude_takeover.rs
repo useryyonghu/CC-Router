@@ -647,3 +647,85 @@ fn no_frontmatter_file_gains_one_for_alias_but_not_for_default() {
     assert_eq!(fs::read(&untouched).unwrap(), AGENT_NO_FRONTMATTER.as_bytes());
 }
 
+// ---------------------------------------------------------------- Task 4
+
+/// 接管清单要存进 `config.json` 的 `takeover.manifest`：**应用重启后还原仍必须逐字节相等**。
+/// 这里用 tempdir + 显式路径走完整往返（IPC 需要 Tauri 运行时，逻辑在本层验证）。
+#[test]
+fn manifest_survives_config_round_trip_and_still_restores_byte_exact() {
+    use cc_router::claude::settings::TakeoverManifest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let backups = dir.path().join("backups");
+    let config_path = dir.path().join("config.json");
+    fs::write(&path, REAL_SHAPE).unwrap();
+    let before = fs::read(&path).unwrap();
+    let mut cfg = demo_cfg();
+
+    let manifest = apply_takeover(&cfg, &path, &backups).unwrap();
+    assert_ne!(fs::read(&path).unwrap(), before, "接管必须真的改了文件");
+
+    // 模拟 takeover_apply 落盘配置
+    cfg.takeover = TakeoverState {
+        enabled: true,
+        applied_at: Some(manifest.applied_at.clone()),
+        backup_file: Some(manifest.pre_bytes_file.clone()),
+        manifest: Some(serde_json::to_value(&manifest).unwrap()),
+        ..TakeoverState::default()
+    };
+    cc_router::config::store::atomic_write_json(&config_path, &cfg).unwrap();
+
+    // 模拟应用重启：从磁盘重新加载配置，取回清单
+    let reloaded = cc_router::config::store::load_from(&config_path).unwrap();
+    assert!(reloaded.takeover.enabled);
+    assert_eq!(reloaded.takeover.backup_file.as_deref(), Some(manifest.pre_bytes_file.as_str()));
+    let stored: TakeoverManifest =
+        serde_json::from_value(reloaded.takeover.manifest.clone().expect("manifest 必须落盘")).unwrap();
+    assert_eq!(stored, manifest, "清单往返不得有任何损失");
+
+    let out = restore(&stored, &path, &backups).unwrap();
+    assert_eq!(out.path, RestorePath::Verbatim);
+    assert_eq!(fs::read(&path).unwrap(), before, "重启后还原仍必须逐字节相同");
+}
+
+/// `takeover.manifest` 是本计划新加的字段：加入之前写的 config.json 必须仍能反序列化。
+#[test]
+fn legacy_config_without_manifest_field_still_deserializes() {
+    let legacy = serde_json::json!({
+        "version": 1,
+        "gateway": {
+            "bind": "127.0.0.1",
+            "port": 8787,
+            "localToken": "sk-ccr-legacy",
+            "maxRequestBodyBytes": 134217728,
+            "connectTimeoutMs": 10000,
+            "idleTimeoutMs": 300000
+        },
+        "providers": [],
+        "roles": {},
+        "extraRoutes": [],
+        "onUnknownModel": "default",
+        "defaultTarget": null,
+        "takeover": {
+            "enabled": false,
+            "appliedAt": null,
+            "backupFile": null,
+            "settingsKeys": null,
+            "agentFiles": null
+        },
+        "ui": {
+            "closeToTray": true,
+            "autostart": false,
+            "requestLogToFile": false,
+            "restoreOnExit": false
+        }
+    });
+
+    let cfg: Config = serde_json::from_value(legacy).unwrap();
+    assert_eq!(cfg.takeover.manifest, None);
+    assert!(!cfg.takeover.enabled);
+    assert_eq!(cfg.gateway.port, 8787);
+}
+
+
