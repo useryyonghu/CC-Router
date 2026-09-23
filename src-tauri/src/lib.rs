@@ -9,6 +9,7 @@ pub mod logging;
 pub mod preset;
 pub mod provider;
 pub mod routing;
+pub mod single_instance;
 pub mod tray;
 
 use crate::commands::AppState;
@@ -43,6 +44,18 @@ pub(crate) fn exit_app<R: Runtime>(app: &AppHandle<R>) -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 单实例守卫必须在**建窗口之前**做：第二次启动（用户又点了一次图标）应当把已有窗口
+    // 拿到前台，而不是再开一个进程+窗口。是第二个实例就立刻返回，连配置都不碰。
+    let startup = crate::single_instance::claim();
+    if matches!(startup, crate::single_instance::Startup::Secondary) {
+        eprintln!("[cc-router] 已有实例在运行，已通知它把窗口拿到前台；本次不再启动第二个窗口");
+        return;
+    }
+    if let crate::single_instance::Startup::Unavailable(why) = &startup {
+        // 端口被陌生程序占用：照常启动，只是这次没法保证单实例。
+        eprintln!("[cc-router] 单实例检查不可用（{why}）：本次启动不做重复实例拦截");
+    }
+
     let store = ConfigStore::load(crate::app_paths::config_path())
         .expect("无法加载 config.json：请检查 %APPDATA%\\cc-router\\config.json");
     let state = AppState::new(store).shared();
@@ -63,6 +76,19 @@ pub fn run() {
         .setup(|app| {
             // 托盘在这里装配：早于窗口显示，用户从托盘起的网关与界面看到的是同一个状态。
             crate::tray::build(app.handle())?;
+            // 第一个实例：在后台线程等后续启动请求，收到就回到主线程把窗口拿到前台。
+            if let crate::single_instance::Startup::Primary(listener) = startup {
+                let handle = app.handle().clone();
+                crate::single_instance::serve_show_requests(listener, move || {
+                    let for_main = handle.clone();
+                    // 窗口操作要回主线程（回调来自监听线程）。
+                    if let Err(e) = handle.run_on_main_thread(move || {
+                        crate::tray::show_main_window(&for_main);
+                    }) {
+                        eprintln!("[cc-router] 把「显示主窗口」派发到主线程失败：{e}");
+                    }
+                });
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -88,6 +114,7 @@ pub fn run() {
             commands::agent_create,
             commands::agent_delete,
             commands::agent_set_model,
+            commands::agent_backups_list,
             commands::agents_list,
             commands::autostart_get,
             commands::autostart_set,

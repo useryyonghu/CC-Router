@@ -583,13 +583,12 @@ fn looks_like_inserted_block(lines: &[&str]) -> bool {
 /// `agents/a/b.md` 与 `agents/a_b.md`、`agents/reviewer pro.md` 与 `agents/reviewer_pro.md`
 /// 都得到同一个 71 字符的扁平串。按长度阈值决定是否加哈希，等于让最常见的短路径落进
 /// 上面那条不可恢复的碰撞路径；只有无条件哈希才能让映射（在 64 位 FNV-1a 的强度内）单射。
-fn backup_name(path: &Path, stamp: &str) -> String {
-    // canonicalize 让同一文件的不同写法（大小写、`..`、符号链接）落到同一个键上，
-    // 使"同一文件同一 stamp 只备份一次"仍然成立。
-    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let raw = resolved.to_string_lossy().to_string();
-    let text = raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string();
-
+/// 备份名使用的**扁平化**规则：`[A-Za-z0-9.\-_]` 之外一律换成 `_`（于是 `/`、`\`、空格与
+/// 本来存在的 `_` 不可区分 —— 单独用它不是单射，所以备份名还要再附完整路径的哈希）。
+///
+/// 抽成函数是为了**从备份名反查原路径**（`agent_backups_list`）：备份名里带着扁平化后的
+/// 完整路径，用同一条规则把已知路径扁平化后比对，就能把"那个看不懂的文件名"还原成"哪个 agent"。
+pub(crate) fn flatten_for_backup(text: &str) -> String {
     let mut flat = String::with_capacity(text.len());
     for ch in text.chars() {
         // 非 ASCII 字符也替换成 '_'：结果保证是纯 ASCII，后面按字节切片才安全。
@@ -599,6 +598,25 @@ fn backup_name(path: &Path, stamp: &str) -> String {
             flat.push('_');
         }
     }
+    flat
+}
+
+/// 把路径按 `backup_name` 同一套规则规范化（canonicalize → 去掉 `\\?\` 前缀）后扁平化。
+pub(crate) fn flatten_path(path: &Path) -> String {
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let raw = resolved.to_string_lossy().to_string();
+    let text = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    flatten_for_backup(text)
+}
+
+fn backup_name(path: &Path, stamp: &str) -> String {
+    // canonicalize 让同一文件的不同写法（大小写、`..`、符号链接）落到同一个键上，
+    // 使"同一文件同一 stamp 只备份一次"仍然成立。
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let raw = resolved.to_string_lossy().to_string();
+    let text = raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string();
+
+    let mut flat = flatten_for_backup(&text);
     let hash = fnv1a_hex16(&text);
     if flat.len() > 120 {
         // 文件名长度上限（Windows 255）：保留信息量最大的尾部，并附**完整路径**的哈希

@@ -878,6 +878,179 @@ pub fn backups_list() -> Vec<BackupDto> {
     out
 }
 
+/// 一条**子 Agent 备份**。用户反馈：删除子 Agent 时提示"会备份到某处"，事后却找不到 ——
+/// 因为 `backups_list()` 只列 `backups/` 顶层文件、明确跳过子目录，`backups/agents/` 从来不出现。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentBackupDto {
+    /// 人类可读的名称：优先取原文件的文件名，取不到时退回备份文件名（去掉时间戳）。
+    pub name: String,
+    /// 被备份的 agent 文件**原始路径**（清单里记着时才有）。
+    pub agent_path: Option<String>,
+    /// 该文件现在是否还在：在 ⇒ 这是一次"改动备份"；不在 ⇒ 是"删除前的备份"。
+    pub agent_exists: bool,
+    /// `deleted`（文件已不存在，多半是删除）| `modified`（文件还在，是改动前留的）| `unknown`（无法确定原文件）。
+    pub kind: String,
+    /// 原路径是**推测**的（备份名里的 `_` 无法区分"路径分隔符"与"文件名里本来就有的下划线"）。
+    pub agent_path_is_guess: bool,
+    /// 备份文件的绝对路径 —— 界面里点一下就复制。
+    pub backup_path: String,
+    pub size_bytes: u64,
+    pub modified_at: Option<String>,
+}
+
+/// 从备份文件名里取出"扁平化的完整路径"部分。
+///
+/// 备份名格式（见 `claude::agents::backup_name`）：`{扁平化完整路径}-{16位hash}.{stamp}.bak`。
+/// 超长路径那一支保留的是尾部 80 字符，与本函数无关（那种情况反查会失败，界面显示"来源未知"）。
+fn flat_part_of_backup(file_name: &str) -> Option<String> {
+    let stem = file_name.strip_suffix(".bak")?;
+    let (head, stamp) = stem.rsplit_once('.')?;
+    if stamp.len() != 15 || !stamp.contains('T') {
+        return None;
+    }
+    let (flat, hash) = head.rsplit_once('-')?;
+    if hash.len() != 16 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(flat.to_string())
+}
+
+/// 清单里查不到时的最后手段：拿扁平化路径与**已知的 agents 目录**比对。
+///
+/// 相对部分**不含 `_`** ⇒ 还原无歧义（返回值第二项 = false）；
+/// 含 `_` ⇒ 原来的下划线与路径分隔符已不可区分，只能给出推测（第二项 = true，界面会标注"推测"）。
+fn decode_from_flat(flat: &str, agents_flat: &str, agents_dir: &std::path::Path) -> Option<(String, bool)> {
+    let rel = flat.strip_prefix(agents_flat)?;
+    let rel = rel.strip_prefix('_').unwrap_or(rel);
+    if rel.is_empty() {
+        return None;
+    }
+    if rel.contains('_') {
+        Some((
+            agents_dir.join(rel.replace('_', "\\")).to_string_lossy().to_string(),
+            true,
+        ))
+    } else {
+        Some((agents_dir.join(rel).to_string_lossy().to_string(), false))
+    }
+}
+
+/// 列出 `backups/agents/` 下的子 Agent 备份（新的在前），并尽量还原出**原始文件路径**与状态。
+///
+/// 反查原路径有三个来源，依次尝试：
+///  1. 清单里 `backup_file` 正好等于这个备份文件（最权威）；
+///  2. 清单（或当前 agents 目录）里某个路径的**扁平化形式**正好等于备份名里的扁平原路径 ——
+///     这一条很重要：`record_agent_change` 是"首次写入优先"，所以**应用新建、之后又删除**的文件
+///     在清单里 `backupFile` 是 `null`，只靠第 1 条会查不到（而这正是用户反馈的场景）；
+///  3. 用已知 agents 目录前缀解码（可能只能给出推测）。
+/// 三条都失败时仍把备份列出来（`kind = unknown`），不让它继续"找不到"。
+#[tauri::command]
+pub fn agent_backups_list(state: State<'_, Arc<AppState>>) -> Vec<AgentBackupDto> {
+    let dir = crate::app_paths::backups_dir().join("agents");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let cfg = state.store.snapshot();
+
+    // 已知路径 → 扁平化形式；同时记下清单里的 backup_file 映射。
+    let mut by_backup: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut by_flat: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (path, entry) in &cfg.takeover.agent_files {
+        by_flat.insert(
+            crate::claude::agents::flatten_path(std::path::Path::new(path)),
+            path.clone(),
+        );
+        if let Some(backup_file) = &entry.backup_file {
+            by_backup.insert(backup_file.clone(), path.clone());
+        }
+    }
+    let agents_dir = crate::claude::agents::agents_dir();
+    if let Ok(list) = crate::claude::agents::list_agents(&agents_dir) {
+        for file in list {
+            by_flat.insert(
+                crate::claude::agents::flatten_path(&file.path),
+                file.path.to_string_lossy().to_string(),
+            );
+        }
+    }
+    let agents_flat = crate::claude::agents::flatten_path(&agents_dir);
+
+    let mut out: Vec<AgentBackupDto> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            let flat_part = flat_part_of_backup(&file_name);
+            // (原路径, 是否是推测)
+            let resolved: Option<(String, bool)> = by_backup
+                .get(&format!("agents/{file_name}"))
+                .map(|p| (p.clone(), false))
+                .or_else(|| {
+                    flat_part
+                        .as_ref()
+                        .and_then(|flat| by_flat.get(flat).map(|p| (p.clone(), false)))
+                })
+                .or_else(|| {
+                    flat_part
+                        .as_ref()
+                        .and_then(|flat| decode_from_flat(flat, &agents_flat, &agents_dir))
+                });
+            let agent_path = resolved.as_ref().map(|(p, _)| p.clone());
+            let is_guess = resolved.as_ref().map(|(_, g)| *g).unwrap_or(false);
+            let agent_exists = agent_path
+                .as_deref()
+                .map(|p| std::path::Path::new(p).exists())
+                .unwrap_or(false);
+            let kind = match (&agent_path, agent_exists) {
+                (None, _) => "unknown",
+                (Some(_), true) => "modified",
+                (Some(_), false) => "deleted",
+            };
+            let name = agent_path
+                .as_deref()
+                .and_then(|p| std::path::Path::new(p).file_name())
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| strip_backup_suffix(&file_name));
+            Some(AgentBackupDto {
+                name,
+                agent_path,
+                agent_path_is_guess: is_guess,
+                agent_exists,
+                kind: kind.to_string(),
+                backup_path: entry.path().to_string_lossy().to_string(),
+                size_bytes: meta.len(),
+                modified_at: meta
+                    .modified()
+                    .ok()
+                    .map(|t| chrono::DateTime::<chrono::Local>::from(t).to_rfc3339()),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+    out
+}
+
+/// 完全查不到原路径时的兜底显示名：去掉 `-<16位hash>` 与 `<stamp>.bak` 尾巴。
+fn strip_backup_suffix(file_name: &str) -> String {
+    let stem = file_name.strip_suffix(".bak").unwrap_or(file_name);
+    // 先剪时间戳（形如 20260923T124859），只在"看起来像时间戳"时才剪，避免误剪正常文件名
+    let stem = match stem.rsplit_once('.') {
+        Some((head, stamp)) if stamp.len() == 15 && stamp.contains('T') => head,
+        _ => stem,
+    };
+    // 再剪 `-<16位十六进制>` 哈希（`backup_name` 无条件附加的那一段）
+    match stem.rsplit_once('-') {
+        Some((head, hash)) if hash.len() == 16 && hash.chars().all(|c| c.is_ascii_hexdigit()) => {
+            head.to_string()
+        }
+        _ => stem.to_string(),
+    }
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsPathsDto {
@@ -946,6 +1119,52 @@ mod tests {
         UnknownModelPolicy, DEFAULT_BIND, DEFAULT_MAX_BODY_BYTES,
     };
     use crate::provider::RoleSlot;
+
+    /// 备份名 → 扁平原路径。用真机上的真实名字做夹具（含 `-` 与 `_`，最容易切错）。
+    #[test]
+    fn flat_part_of_backup_parses_the_real_name_shape() {
+        assert_eq!(
+            flat_part_of_backup(
+                "C__Users_me_.claude_agents_reviewer.md-29d8bf14ee6ea9ea.20260923T135817.bak"
+            )
+            .as_deref(),
+            Some("C__Users_me_.claude_agents_reviewer.md")
+        );
+        // 设置备份不是这个形状（没有 `-<hash>`）：必须拒绝，不能瞎切
+        assert_eq!(flat_part_of_backup("settings.json.20260923T094244.pre.bak"), None);
+        assert_eq!(flat_part_of_backup("garbage.bak"), None);
+    }
+
+    #[test]
+    fn strip_backup_suffix_removes_hash_and_stamp() {
+        assert_eq!(
+            strip_backup_suffix(
+                "C__Users_me_.claude_agents_zz-backup-probe.md-3e43c30ab0f7fee5.20260923T151907.bak"
+            ),
+            "C__Users_me_.claude_agents_zz-backup-probe.md"
+        );
+    }
+
+    /// 反查原路径：相对部分不含 `_` ⇒ 精确；含 `_` ⇒ 只能推测，且**必须**标注为推测。
+    #[test]
+    fn decode_from_flat_is_exact_without_underscore_and_a_guess_with_it() {
+        let dir = Path::new(r"C:\Users\me\.claude\agents");
+        let dir_flat = agents::flatten_for_backup(r"C:\Users\me\.claude\agents");
+
+        let exact = agents::flatten_for_backup(r"C:\Users\me\.claude\agents\reviewer.md");
+        assert_eq!(
+            decode_from_flat(&exact, &dir_flat, dir),
+            Some((r"C:\Users\me\.claude\agents\reviewer.md".to_string(), false))
+        );
+
+        let ambiguous = agents::flatten_for_backup(r"C:\Users\me\.claude\agents\my_agent.md");
+        let (path, is_guess) = decode_from_flat(&ambiguous, &dir_flat, dir).expect("应给出推测");
+        assert!(is_guess, "相对部分含下划线时必须标注为推测，不能假装精确");
+        assert_eq!(path, r"C:\Users\me\.claude\agents\my\agent.md");
+
+        // 前缀对不上（例如超长路径那条支路只留了尾部）⇒ 宁可不给，也不瞎猜
+        assert_eq!(decode_from_flat("something_else.md", &dir_flat, dir), None);
+    }
 
     fn provider(id: &str, base: &str, models: &[(&str, &str)]) -> ConfigProvider {
         ConfigProvider {

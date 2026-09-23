@@ -33,11 +33,16 @@ pub const MENU_ITEMS: [(&str, &str); 6] = [
 
 /// 显示并聚焦主窗口。
 ///
-/// 三个调用方：左键点击托盘图标、「显示主窗口」菜单项、以及"退出时还原失败"时把窗口
-/// 拉回前台（见 `lib.rs::exit_app`）。
+/// 调用方：左键点击托盘图标、「显示主窗口」菜单项、"退出时还原失败"把窗口拉回前台
+/// （见 `lib.rs::exit_app`），以及**第二次启动时由单实例守卫转达**（见 `single_instance.rs`）。
 pub(crate) fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     match app.get_webview_window(MAIN_WINDOW_LABEL) {
         Some(window) => {
+            // `unminimize` 要一起做：窗口处于最小化时只调 `show()`，它仍留在任务栏里，
+            // 用户再点一次图标会觉得"没反应"。
+            if let Err(e) = window.unminimize() {
+                eprintln!("[cc-router] 还原主窗口失败：{e}");
+            }
             if let Err(e) = window.show() {
                 eprintln!("[cc-router] 显示主窗口失败：{e}");
             }

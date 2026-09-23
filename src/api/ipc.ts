@@ -525,6 +525,28 @@ export function backupsList(): Promise<BackupDto[]> {
   return call<BackupDto[]>("backups_list");
 }
 
+/** `agent_backups_list` 的一项：`backups/agents/` 下的子 Agent 备份。 */
+export interface AgentBackupDto {
+  /** 人类可读名称：优先原文件名，取不到时用备份文件名。 */
+  name: string;
+  /** 被备份的 agent 文件原始路径（清单里记着时才有）。 */
+  agentPath: string | null;
+  /** 该文件现在是否还在（在 = 改动备份；不在 = 删除前的备份）。 */
+  agentExists: boolean;
+  /** 原路径是从备份名**推测**出来的（`_` 无法区分分隔符与下划线），界面会标注。 */
+  agentPathIsGuess: boolean;
+  /** `deleted` | `modified` | `unknown`。 */
+  kind: string;
+  /** 备份文件绝对路径（界面里点一下复制）。 */
+  backupPath: string;
+  sizeBytes: number;
+  modifiedAt: string | null;
+}
+
+export function agentBackupsList(): Promise<AgentBackupDto[]> {
+  return call<AgentBackupDto[]>("agent_backups_list");
+}
+
 export function settingsPaths(): Promise<SettingsPaths> {
   return call<SettingsPaths>("settings_paths");
 }

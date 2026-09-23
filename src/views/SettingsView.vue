@@ -33,6 +33,7 @@ import type { BackupDto, Config } from "../api/ipc";
 import { backupLabel, errorText, settingsPathValue } from "../api/ipc";
 import { useAction } from "../composables/useAction";
 import { useConfirm } from "../composables/useConfirm";
+import { useCopy } from "../composables/useCopy";
 import { CC_SWITCH_LICENSE_TEXT, CC_SWITCH_SOURCE, CC_SWITCH_SOURCE_REF, CC_SWITCH_URL } from "../constants";
 import { useConfigStore } from "../stores/config";
 
@@ -244,41 +245,8 @@ const maskedToken = computed(() => {
   return token.length <= 12 ? "•".repeat(token.length) : `${token.slice(0, 7)}…${token.slice(-4)}`;
 });
 
-function copyText(text: string, label: string): void {
-  if (!text) {
-    message.warning(`${label}为空`);
-    return;
-  }
-  const fallback = (): boolean => {
-    const area = document.createElement("textarea");
-    area.value = text;
-    area.style.position = "fixed";
-    area.style.opacity = "0";
-    document.body.appendChild(area);
-    area.select();
-    // `execCommand` 返回布尔值：以前忽略它，失败了也照样弹「已复制」—— 与"界面不能撒谎"相悖。
-    const ok = document.execCommand("copy");
-    document.body.removeChild(area);
-    return ok;
-  };
-  /** 兜底路径的如实反馈：成功才说成功。 */
-  const fallbackThen = (): void => {
-    if (fallback()) message.success(`${label}已复制`);
-    else message.error(`${label}复制失败：浏览器拒绝了复制操作，请手动选中后按 Ctrl+C`);
-  };
-  try {
-    if (navigator.clipboard?.writeText) {
-      navigator.clipboard.writeText(text).then(
-        () => message.success(`${label}已复制`),
-        () => fallbackThen(),
-      );
-    } else {
-      fallbackThen();
-    }
-  } catch (err) {
-    message.error(`复制失败：${errorText(err)}`);
-  }
-}
+/** 复制到剪贴板的实现在 `composables/useCopy.ts`（设置页与子 Agent 页共用一份）。 */
+const { copyText } = useCopy();
 
 async function regenerateToken() {
   const go = await confirm({

@@ -28,16 +28,18 @@ import {
 } from "naive-ui";
 import type { DataTableColumns } from "naive-ui";
 import * as ipc from "../api/ipc";
-import type { AgentInfo, AgentModelChoice, TargetDto } from "../api/ipc";
+import type { AgentBackupDto, AgentInfo, AgentModelChoice, TargetDto } from "../api/ipc";
 import { errorText } from "../api/ipc";
 import { useAction } from "../composables/useAction";
 import { useConfirm } from "../composables/useConfirm";
+import { useCopy } from "../composables/useCopy";
 import ModelPicker from "../components/ModelPicker.vue";
 import { useConfigStore } from "../stores/config";
 
 const store = useConfigStore();
 const { isBusy, run, message } = useAction();
 const { confirm } = useConfirm();
+const { copyText } = useCopy();
 
 const agents = ref<AgentInfo[]>([]);
 const loading = ref(false);
@@ -126,7 +128,105 @@ async function load(): Promise<void> {
   } finally {
     loading.value = false;
   }
+  // 备份清单与 agent 列表总是成对变化（删除/改动都会产生备份），顺手一起刷新。
+  await loadAgentBackups();
 }
+
+// ---------------------------------------------------------------- 子 Agent 备份清单
+
+/**
+ * 删除/改动子 Agent 时会把原文件备份到 `backups/agents/`，但**设置页的备份列表看不到它**
+ * （那个命令只列 `backups/` 顶层文件）。用户反馈"提示会备份，事后不好找"，所以在这里列出来：
+ * 名称、原路径、备份文件路径，两条路径都点击即复制。
+ */
+const agentBackups = ref<AgentBackupDto[]>([]);
+const backupsLoading = ref(false);
+
+async function loadAgentBackups(): Promise<void> {
+  backupsLoading.value = true;
+  try {
+    agentBackups.value = await ipc.agentBackupsList();
+  } catch (err) {
+    message.error(`读取子 Agent 备份失败：${errorText(err)}`, { duration: 8000, closable: true });
+  } finally {
+    backupsLoading.value = false;
+  }
+}
+
+const KIND_META: Record<string, { text: string; type: "error" | "warning" | "default" }> = {
+  deleted: { text: "已删除", type: "error" },
+  modified: { text: "改动前备份", type: "warning" },
+  unknown: { text: "来源未知", type: "default" },
+};
+
+function formatBackupTime(iso: string | null): string {
+  if (!iso) return "—";
+  const parsed = new Date(iso);
+  return Number.isNaN(parsed.getTime()) ? iso : parsed.toLocaleString();
+}
+
+/** 可点击复制的路径单元格：点击即复制，光标与下划线提示"这里能点"。 */
+function pathCell(text: string | null, label: string, guess = false) {
+  if (!text) {
+    return h(NText, { depth: 3 }, { default: () => "（无法从备份名确定原文件，用右侧备份文件即可取回）" });
+  }
+  return h(
+    "span",
+    {
+      class: "mono",
+      title: "点击复制这个路径",
+      style: "cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px;",
+      onClick: () => copyText(text, label),
+    },
+    // 推测出来的路径要标出来：备份名里的 `_` 无法区分"路径分隔符"和"文件名里本来就有的下划线"
+    guess ? `${text}（推测）` : text,
+  );
+}
+
+const backupColumns = computed<DataTableColumns<AgentBackupDto>>(() => [
+  {
+    title: "名称",
+    key: "name",
+    width: 180,
+    ellipsis: { tooltip: true },
+    render: (row) => h(NText, { strong: true }, { default: () => row.name }),
+  },
+  {
+    title: "状态",
+    key: "kind",
+    width: 110,
+    render: (row) => {
+      const meta = KIND_META[row.kind] ?? KIND_META.unknown;
+      return h(NTag, { size: "small", type: meta.type }, { default: () => meta.text });
+    },
+  },
+  {
+    title: "原文件路径（点击复制）",
+    key: "agentPath",
+    minWidth: 300,
+    ellipsis: { tooltip: true },
+    render: (row) => pathCell(row.agentPath, "原文件路径", row.agentPathIsGuess),
+  },
+  {
+    title: "备份文件（点击复制）",
+    key: "backupPath",
+    minWidth: 300,
+    ellipsis: { tooltip: true },
+    render: (row) => pathCell(row.backupPath, "备份文件路径"),
+  },
+  {
+    title: "备份时间",
+    key: "modifiedAt",
+    width: 170,
+    render: (row) => formatBackupTime(row.modifiedAt),
+  },
+  {
+    title: "大小",
+    key: "sizeBytes",
+    width: 90,
+    render: (row) => `${row.sizeBytes} B`,
+  },
+]);
 
 onMounted(() => {
   void load();
@@ -411,6 +511,34 @@ const columns = computed<DataTableColumns<AgentInfo>>(() => [
         :bordered="false"
         size="small"
         :scroll-x="1320"
+      />
+    </n-card>
+
+    <!--
+      用户反馈：删除子 Agent 时提示"会备份到某处"，事后却不好找。
+      原因：设置页的 `backups_list` 只列 `backups/` 顶层文件，**子目录 `backups/agents/` 从来不出现**。
+      所以在这里把子 Agent 备份单独列出来，并把两条路径都做成"点击即复制"。
+    -->
+    <n-card size="small" title="已删除 / 已备份的子 Agent" style="margin-top: 12px">
+      <template #header-extra>
+        <n-button size="small" :loading="backupsLoading" @click="loadAgentBackups">刷新</n-button>
+      </template>
+      <n-text depth="3">
+        删除或改动子 Agent 前，原文件会备份到
+        <span class="mono">%APPDATA%\cc-router\backups\agents\</span>（按时间倒序）。
+        <b>点路径即可复制</b> —— 需要还原时把备份文件复制回「原文件路径」覆盖即可。
+      </n-text>
+      <n-data-table
+        :columns="backupColumns"
+        :data="agentBackups"
+        :row-key="(row) => row.backupPath"
+        :loading="backupsLoading"
+        :bordered="false"
+        size="small"
+        style="margin-top: 10px"
+        :max-height="260"
+        :scroll-x="1150"
+        :locale="{ empty: '还没有子 Agent 备份（删除或改动子 Agent 时会自动生成）' }"
       />
     </n-card>
 
