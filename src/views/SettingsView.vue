@@ -47,9 +47,23 @@ const autostart = ref(true);
 const restoreOnExit = ref(false);
 const requestLogToFile = ref(false);
 
+/**
+ * 本地草稿只在**磁盘上的值真的变了**时重新灌入（M10）。
+ *
+ * 原来监听整个 `store.config` 对象：任何一次 refreshConfig()（例如在同一个页面里
+ * 「重新生成令牌」「导入配置」）都会把用户还没保存的端口 / 开关改动弹回旧值。
+ * 这里逐字段监听原始值 —— 与这些字段无关的刷新不再动草稿。
+ */
 watch(
-  () => store.config,
-  (config) => {
+  [
+    () => store.config?.gateway.port ?? null,
+    () => store.config?.ui.closeToTray ?? null,
+    () => store.config?.ui.autostart ?? null,
+    () => store.config?.ui.restoreOnExit ?? null,
+    () => store.config?.ui.requestLogToFile ?? null,
+  ],
+  () => {
+    const config = store.config;
     if (!config) return;
     port.value = config.gateway.port;
     closeToTray.value = config.ui.closeToTray;

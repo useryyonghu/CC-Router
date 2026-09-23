@@ -252,9 +252,25 @@ const routeColumns: DataTableColumns<ExtraRoute> = [
 const policy = ref<UnknownModelPolicy>("default");
 const defaultTarget = ref<TargetDto | null>(null);
 
+/**
+ * 本地草稿只在**磁盘上的策略 / 默认目标真的变了**时重新灌入（M10）。
+ *
+ * 原来监听整个 `store.config` 对象，而同一个页面里「添加额外规则」会 saveConfig +
+ * refreshConfig ⇒ 用户刚选好、还没点「保存策略」的未知模型策略会被弹回旧值。
+ * 这里监听两个**按值稳定**的键（策略字符串、`providerId/modelId`）：
+ * `config.defaultTarget` 是每次刷新都新建的对象，直接监听它会退化成"每次都重置"。
+ * 两个键由「保存策略」一起写入，所以一个 watcher 同时重灌两者不会互相打架。
+ */
 watch(
-  () => store.config,
-  (config) => {
+  [
+    () => store.config?.onUnknownModel ?? null,
+    () => {
+      const target = store.config?.defaultTarget;
+      return target ? `${target.providerId}/${target.modelId}` : "";
+    },
+  ],
+  () => {
+    const config = store.config;
     if (!config) return;
     policy.value = config.onUnknownModel;
     defaultTarget.value = config.defaultTarget;
