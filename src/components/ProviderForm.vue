@@ -137,26 +137,48 @@ const newModelName = ref("");
 const testModelId = ref<string | null>(null);
 const testResult = ref<TestResult | null>(null);
 
+/**
+ * 从配置快照重建模型行，但**保留已存在行的未保存改动**（按模型 id 对齐）。
+ * 加 / 删模型会 `refreshConfig()`，这一步只让表格跟上磁盘上的模型集合，
+ * 不会碰到用户正在编辑的显示名 / 别名 / 1M / 上下文窗口 / max_tokens。
+ */
+function seedModelRows(current: Provider): void {
+  const drafts = new Map(modelRows.value.map((row) => [row.id, row]));
+  modelRows.value = current.models.map(
+    (model) =>
+      drafts.get(model.id) ?? {
+        id: model.id,
+        name: model.name,
+        alias: model.alias,
+        context1m: model.context1m,
+        contextWindow: model.contextWindow,
+        maxTokens: model.maxTokens,
+      },
+  );
+}
+
+/**
+ * **只在服务商身份（id）变化时**重置草稿：切换服务商、或首次拿到配置快照。
+ *
+ * 原来 `deep: true` 监听整个 provider 对象，而「加 / 删模型」成功后会
+ * `refreshConfig()` ⇒ 用户改过但还没点保存的 API Key / 名称 / Base URL / 别名
+ * 会在加一个模型的瞬间被静默丢弃（I2）。身份没变就不重置，这些编辑就能活到保存。
+ */
 watch(
-  provider,
-  (current) => {
-    if (!current) return;
+  () => provider.value?.id ?? null,
+  (id) => {
+    const current = provider.value;
+    if (!id || !current) return;
     editDraft.id = current.id;
     editDraft.name = current.name;
     editDraft.baseUrl = current.baseUrl;
     editDraft.apiKey = current.apiKey;
     editDraft.authStyle = current.authStyle;
     editDraft.modelsUrl = current.modelsUrl ?? "";
-    modelRows.value = current.models.map((model) => ({
-      id: model.id,
-      name: model.name,
-      alias: model.alias,
-      context1m: model.context1m,
-      contextWindow: model.contextWindow,
-      maxTokens: model.maxTokens,
-    }));
+    modelRows.value = []; // 换服务商：整表按新身份重建
+    seedModelRows(current);
   },
-  { immediate: true, deep: true },
+  { immediate: true },
 );
 
 function saveProvider() {
@@ -214,6 +236,9 @@ function addModel() {
         context1m,
       });
       await store.refreshConfig();
+      // 只把模型行对齐到新快照：API Key / 名称 / Base URL / 其它模型的编辑都留在草稿里。
+      const fresh = store.providerById(current.id);
+      if (fresh) seedModelRows(fresh);
       newModelId.value = "";
       newModelName.value = "";
       message.success(`已添加模型，别名：${alias}`);
@@ -237,6 +262,9 @@ async function removeModel(modelId: string) {
     async () => {
       await ipc.modelRemove(current.id, modelId);
       await store.refreshConfig();
+      // 同上：只让被删的行消失，未保存的其它编辑不丢。
+      const fresh = store.providerById(current.id);
+      if (fresh) seedModelRows(fresh);
     },
     "模型已删除",
     `rm-${modelId}`,
@@ -483,8 +511,8 @@ const modelColumns = computed<DataTableColumns<ModelRow>>(() => [
         :max-height="260"
       />
       <n-text depth="3" style="display: block; margin: 8px 0">
-        显示名 / 别名 / 1M / 上下文窗口 / max_tokens 的改动点「保存服务商」后生效；新增与删除立即生效。
-        上下文窗口与 max_tokens 仅用于界面展示（网关不依赖它们）。
+        显示名 / 别名 / 1M / 上下文窗口 / max_tokens 的改动点「保存服务商」后生效；新增与删除立即生效
+        （只重读模型列表，不碰上面还没保存的改动）。上下文窗口与 max_tokens 仅用于界面展示（网关不依赖它们）。
       </n-text>
 
       <n-space align="center">
