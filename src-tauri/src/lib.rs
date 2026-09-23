@@ -1,4 +1,5 @@
 pub mod app_paths;
+pub mod claude;
 pub mod commands;
 pub mod config;
 pub mod error;
