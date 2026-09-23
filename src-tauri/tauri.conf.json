@@ -25,6 +25,21 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "icon": []
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "publisher": "CC Router Project",
+    "shortDescription": "Claude Code 的本地多模型路由网关 / A local multi-model routing gateway for Claude Code",
+    "longDescription": "CC Router 是运行在本机的多模型路由网关：为 Claude Code 统一接入多个模型供应商，按配置将请求转发到目标模型，模型端点、密钥与路由规则全部在本地管理，无需改动 Claude Code 的调用方式。/ CC Router is a locally running multi-model routing gateway for Claude Code: it puts several model providers behind one local endpoint, forwards each request to the configured model, and keeps endpoints, credentials and routing rules on the local machine without changing how Claude Code is invoked.",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": false
+      }
+    }
   }
 }
