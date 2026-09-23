@@ -80,8 +80,12 @@ pub async fn gateway_status(state: State<'_, Arc<AppState>>) -> Result<GatewaySt
     })
 }
 
-#[tauri::command]
-pub async fn gateway_start(state: State<'_, Arc<AppState>>) -> Result<u16, String> {
+/// [`gateway_start`] 的实现体：已在跑则返回现有端口，否则按**当前配置**启动。
+///
+/// 与 `#[tauri::command]` 外壳分离是为了让托盘「启动网关」调用同一份实现
+/// （ledger R33：同一段顺序抄两遍，就会在两处各错一次）。
+/// 调用点：IPC 外壳 + `gateway_restart` + 托盘菜单 = 3 处。
+pub(crate) async fn gateway_start_impl(state: &AppState) -> Result<u16, String> {
     let mut guard = state.gateway.lock().await;
     if let Some(g) = guard.as_ref() {
         return Ok(g.bound_port);
@@ -96,7 +100,14 @@ pub async fn gateway_start(state: State<'_, Arc<AppState>>) -> Result<u16, Strin
 }
 
 #[tauri::command]
-pub async fn gateway_stop(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+pub async fn gateway_start(state: State<'_, Arc<AppState>>) -> Result<u16, String> {
+    gateway_start_impl(&state).await
+}
+
+/// [`gateway_stop`] 的实现体：停掉在跑的网关；本来没跑就是空操作。
+///
+/// 调用点：IPC 外壳 + `gateway_restart` + 托盘菜单 = 3 处。
+pub(crate) async fn gateway_stop_impl(state: &AppState) -> Result<(), String> {
     let mut guard = state.gateway.lock().await;
     if let Some(gw) = guard.take() {
         gw.shutdown().await;
@@ -105,8 +116,19 @@ pub async fn gateway_stop(state: State<'_, Arc<AppState>>) -> Result<(), String>
 }
 
 #[tauri::command]
+pub async fn gateway_stop(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    gateway_stop_impl(&state).await
+}
+
+#[tauri::command]
 pub fn get_config(state: State<'_, Arc<AppState>>) -> Config {
-    state.store.snapshot()
+    let mut cfg = state.store.snapshot();
+    // 开机自启：**注册表是唯一事实来源**，`ui.autostart` 只是它的镜像（缓存）。
+    // 这里用注册表实测值覆盖配置里的值，界面开关才会永远显示系统真实状态。
+    // 详细裁定与理由见 `crate::autostart` 的模块注释（ledger R40 修正）：
+    // 手改 `config.json` 的 `autostart` 字段**刻意不生效** —— 系统级状态不该被数据文件悄悄改变。
+    cfg.ui.autostart = crate::autostart::is_enabled();
+    cfg
 }
 
 #[tauri::command]
@@ -173,6 +195,14 @@ pub fn takeover_status(state: State<'_, Arc<AppState>>) -> TakeoverStatusDto {
 
 #[tauri::command]
 pub fn takeover_apply(state: State<'_, Arc<AppState>>) -> Result<TakeoverStatusDto, String> {
+    takeover_apply_impl(&state)
+}
+
+/// [`takeover_apply`] 的实现体（spec §7.2）。
+///
+/// 与命令外壳分离是为了让托盘「接管 Claude Code」调用同一份实现（ledger R33）。
+/// 调用点：IPC 外壳 + 托盘菜单 = 2 处。
+pub(crate) fn takeover_apply_impl(state: &AppState) -> Result<TakeoverStatusDto, String> {
     let mut cfg = state.store.snapshot();
 
     // 前置检查（spec §7.2 步骤 1）：配置校验通过 + 三个角色槽位都已绑定。
@@ -222,6 +252,15 @@ pub fn takeover_apply(state: State<'_, Arc<AppState>>) -> Result<TakeoverStatusD
 
 #[tauri::command]
 pub fn takeover_restore(state: State<'_, Arc<AppState>>) -> Result<RestoreDto, String> {
+    takeover_restore_state(&state)
+}
+
+/// [`takeover_restore`] 的实现体入口：把 `AppState` 里的两个路径解出来交给
+/// [`takeover_restore_impl`]。
+///
+/// 与命令外壳分离是为了让托盘「还原」和「退出时还原」调用同一份实现（ledger R33）。
+/// 调用点：IPC 外壳 + 托盘菜单 + `lib.rs::exit_app` = 3 处。
+pub(crate) fn takeover_restore_state(state: &AppState) -> Result<RestoreDto, String> {
     let (settings_path, backups_dir) = state.claude_paths();
     takeover_restore_impl(&state.store, &settings_path, &backups_dir)
 }
@@ -685,19 +724,13 @@ pub fn models_add_many(
 }
 
 /// 重启网关：先停（若在跑）再用当前配置启动，返回新的绑定端口（spec §5.5 改端口后立即生效）。
+///
+/// 停与启动各自复用同一个实现（ledger R33）：这里以前把 `server::start(...)` 的
+/// 调用序列又抄了一遍，于是"启动顺序"这件事实存在两份。
 #[tauri::command]
 pub async fn gateway_restart(state: State<'_, Arc<AppState>>) -> Result<u16, String> {
-    let mut guard = state.gateway.lock().await;
-    if let Some(gw) = guard.take() {
-        gw.shutdown().await;
-    }
-    let config = state.store.shared();
-    let gw = crate::gateway::server::start(config, state.log.clone())
-        .await
-        .map_err(|e| e.to_string())?;
-    let port = gw.bound_port;
-    *guard = Some(gw);
-    Ok(port)
+    gateway_stop_impl(&state).await?;
+    gateway_start_impl(&state).await
 }
 
 // ---------------------------------------------------------------- 令牌 / 备份 / 路径（spec §9.2 / §10.5）
@@ -868,6 +901,41 @@ pub fn settings_paths() -> SettingsPathsDto {
         presets_user_path: s(crate::preset::presets_user_path()),
         logs_dir: s(crate::app_paths::logs_dir()),
     }
+}
+
+// ---------------------------------------------------------------- 开机自启（spec §12 / ledger R40 修正）
+
+/// 读**注册表**里 `HKCU\...\Run\CC Router` 的真实状态 —— 不读 `config.json`。
+///
+/// 注册表是唯一事实来源；`ui.autostart` 只是镜像（详见 `crate::autostart` 模块注释）。
+#[tauri::command]
+pub fn autostart_get() -> bool {
+    crate::autostart::is_enabled()
+}
+
+/// 写/删注册表自启项，返回**实测**状态（不是 `enabled` 请求值），并把镜像同步为该实测值。
+///
+/// 语义（裁定，见 `crate::autostart` 模块注释 / ledger R40 修正）：
+///
+/// - **注册表只在用户调用本命令时改变**：启动时不写注册表，`save_config` 也不写 ——
+///   否则 `UiConfig::default()` 里的 `autostart: true` 会让"打开一次应用"就等于
+///   "在这台机器的 HKCU Run 里静默写入一条开机自启项"，那是用户没要求的系统级副作用。
+/// - 返回值是**改动之后重新读注册表**得到的实测状态：写失败时它会是 `false`，
+///   前端据此把开关拨回去并报错，绝不会出现"界面显示已开启、注册表里其实没有"。
+/// - 镜像（`ui.autostart`）落盘失败**不影响返回值**：注册表才是事实来源，
+///   镜像写不进去只记一条日志，绝不让返回值跟着一起撒谎。
+#[tauri::command]
+pub fn autostart_set(state: State<'_, Arc<AppState>>, enabled: bool) -> bool {
+    let observed = crate::autostart::set_enabled(enabled);
+
+    let mut cfg = state.store.snapshot();
+    if cfg.ui.autostart != observed {
+        cfg.ui.autostart = observed;
+        if let Err(e) = state.store.save(cfg) {
+            eprintln!("[cc-router] 同步 ui.autostart 镜像失败（注册表状态不受影响）：{e}");
+        }
+    }
+    observed
 }
 
 #[cfg(test)]
