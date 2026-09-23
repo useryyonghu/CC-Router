@@ -260,7 +260,7 @@ UI 保存 → 后端校验 → 原子写盘 → 更新 `Arc<RwLock<Config>>` →
 3. **不搬运 cc-switch 的推广关系**。
 
 **`verifiedAt` 的诚实语义**
-只有 **3 条**在本机有实测证据：**DeepSeek**（`https://api.deepseek.com/anthropic`，见 `~/.claude/envs.json` 里"严格按照官方 PowerShell 配置"那条可用预设）、**小米 MiMo**（`https://api.xiaomimimo.com/anthropic`，当前正在生效）、**Anthropic 官方**。其余 **85 条一律 `verifiedAt: null`**，UI 角标显示"来自 cc-switch 预设，未在本机验证"。**不谎称已验证。** 用户可用「测试连接」把某条自行升级为已验证（结果只记在本地）。
+只有 **3 条**在本机有实测证据：**DeepSeek**（`https://api.deepseek.com/anthropic`，见 `~/.claude/envs.json` 里"严格按照官方 PowerShell 配置"那条可用预设）、**小米 MiMo**（`https://api.xiaomimimo.com/anthropic`，当前正在生效）、**Anthropic 官方**。其余 **90 条一律 `verifiedAt: null`**，UI 角标显示"来自 cc-switch 预设，未在本机验证"。**不谎称已验证。** 本版本**没有**"把某条预设升级为已验证"的机制：「测试连接」的结果只在界面上即时显示，不写回预设目录，`verifiedAt` 始终只是构建期事实（3 条 / 85 条 `null`）。之所以把这条承诺删掉而不是保留，是因为一个点不动的角标会让用户以为"我标记过了"——假承诺比不做更糟。用户若要长期记住某条可用，用 §5.6 的 `presets.user.json` 覆盖或干脆建自定义服务商。
 
 > 反例警示：cc-switch 出现过"预设生成的 config 与官方文档不一致，且自动拉取模型列表不通"（[issue #6566](https://github.com/farion1231/cc-switch/issues/6566)）。因此本设计把"标注来源与验证状态"和"拉取失败必须有出路"作为硬要求，并把预设做成可被用户覆盖的数据文件——厂商改 URL 时不必等应用发版。
 
@@ -605,16 +605,20 @@ CLAUDE_CODE_SUBAGENT_MODEL          = <roles.subagent 所指模型的别名>
 | AC9 | 手工 E2E 第 2、3 步通过（主 agent 与 subagent 命中不同 provider） |
 | AC10 | 选择任一预设后 `baseUrl` / `authStyle` / `modelsUrl` / `presetId` 被正确预填，且 `apiKey` 保持为空 |
 | AC11 | `一键获取模型` 能从 mock 上游解析出模型列表并把所选模型写入 provider；全部候选失败时 UI 展示每个候选的 URL 与状态，并给出三条出路 |
-| AC12 | 每个内置预设都带来源与验证状态标注：3 条标 `verifiedAt`，其余 85 条显示"来自 cc-switch 预设，未在本机验证" |
-| AC13 | 预设选择器可搜索并分组显示全部 93 条；5 条不支持项禁用并显示原因；3 条需模板输入的选中后弹输入框 |
+| AC12 | 每个内置预设都带来源与验证状态标注：3 条标 `verifiedAt`（`claude-official` / `deepseek` / `xiaomi-mimo`），其余 **90** 条显示"来自 cc-switch 预设，未在本机验证"（93 = 3 + 90） |
+| AC13 | 预设选择器可搜索并分组显示全部 93 条；**7** 条不支持项禁用并显示原因（5 条非 Anthropic 格式 + 2 条需直连厂商的 Bedrock）；3 条需模板输入的选中后弹输入框 |
 | AC14 | 仅填 `baseUrl` + `apiKey` 点「创建并获取模型」即完成创建（`authStyle` 默认 `both`、`id`/`name` 自动推导）；且模型拉取失败时 provider 仍已创建 |
-| AC15 | 26 条带追踪参数的 URL 与 `apiKeyUrl` 中的推广链接均已剥离；无法还原为正常地址的置 `null` |
+| AC15 | `websiteUrl`/`apiKeyUrl` 采用**白名单**：只保留确认可用的参数（`apikey`/`redirect`/`tab`），其余参数一律剥离并在生成时逐条打印供人工复核。推广链接的置 `null` 判据为**三分支且有序**：① **路径段**命中 `/cc-?switch\|ccs/i` ⇒ 整条置 `null`（无法在不破坏链接的前提下清洗路径）；② **白名单参数**的值命中 ⇒ 置 `null`（该参数要保留，污点剥离不掉）；③ **非白名单参数**的值命中 ⇒ 只删该参数、**保留 URL**（参数既已删除，归因随之消失，不应连坐毁掉可用链接）。不透明短链（单段路径含大写字母）与清洗后仅剩 origin 的 `apiKeyUrl` ⇒ `null`，两个栏位同一判据。生成器测试**断言不变量而非计数**：不存在白名单外参数残留、不存在路径段命中、不存在白名单参数值命中、`apikey=%7B%7D` 在 Volcengine 密钥页被保留、且不存在 `supported: true` 却带 `CLAUDE_CODE_USE_*` 的条目 |
 | AC16 | 「关于」页与 README 含 cc-switch 的 MIT 署名与许可证全文；`docs/reference/` 存有上游原件 |
 
 ## 12. 打包与交付
-- `pnpm tauri build` 产出 NSIS 安装包（`.exe`，预期 5–10 MB）+ 可选 MSI。
+- `pnpm tauri build` 产出 NSIS 安装包（`.exe`）+ 可选 MSI。**实测体积约 1.8 MB**（WebView2 不随包分发，故远小于当初"预期 5–10 MB"的估计）。
 - 托盘图标 + 右键菜单（显示主窗口 / 启停网关 / 接管 / 还原 / 退出）。
-- 开机自启（Tauri autostart 插件）。
+- 开机自启：**不加新依赖**，直接写/删 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下名为 `CC Router` 的字符串值
+  （值 = 带引号的当前 exe 绝对路径），走 `reg.exe`（`CREATE_NO_WINDOW`）。**不用 Tauri autostart 插件** ——
+  原方案要求新增 Cargo 依赖，而 Plan 4 的硬约束是"不新增依赖"；HKCU 写入也不需要管理员权限。
+  语义按 ledger R40 的裁定：`ui.autostart` 是**意图**，注册表是**实际状态**，两者在启动时与每次保存后对齐，
+  `config_get` 以注册表实测值覆盖，前端开关失败时回滚到实测值（不许界面显示"已开启"而注册表里没有）。
 - 内置 `presets.json`（93 条预设数据；可被 `%APPDATA%\cc-router\presets.user.json` 覆盖，厂商改 URL 时无需等应用发版）。
 - `docs/reference/` 存档上游原件：`cc-switch-presets.raw.json`（解析后的 93 条原始数据）、`cc-switch-claudeProviderPresets.ts`（上游源文件）、`cc-switch-LICENSE.txt`（MIT 许可证）、`cc-switch-ref.txt`（拉取时的 ref）。
 - **许可证合规**：预设数据来自 `farion1231/cc-switch`（MIT，Copyright © 2025 Jason Young）。应用「关于」页与 README **必须**包含该署名与 MIT 许可证全文。
