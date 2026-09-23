@@ -194,11 +194,18 @@ export interface AgentInfo {
 
 // ---------------------------------------------------------------- 命令的入参 / 出参
 
-/** `provider_add` 的入参；除 `baseUrl` + `apiKey`（spec §5.8 的最少必填）外都可推导。 */
+/**
+ * `provider_add` 的入参；除 `baseUrl` + `apiKey`（spec §5.8 的最少必填）外都可推导。
+ *
+ * **没有 `id` 字段**：`src-tauri/src/provider/mod.rs` 的 `NewProvider`（commit `536d695`/`1a677aa`）
+ * 只有 `baseUrl` / `apiKey` / `name?` / `authStyle?` / `presetId?` / `modelsUrl?`，`id` 由后端
+ * `derive_provider_id(baseUrl)` 推导（重名时加 `-2`）。spec §5.8 说 `id` "可改"，但
+ * `provider_update` 是按 `id` 定位（`provider/mod.rs:143`），所以创建后改名只会得到
+ * "provider 不存在" —— UI 因此把 id 做成只读展示，并在此如实记录该计划缺陷。
+ */
 export interface NewProviderDto {
   baseUrl: string;
   apiKey: string;
-  id?: string;
   name?: string;
   authStyle?: AuthStyle;
   presetId?: string;
@@ -249,12 +256,14 @@ export interface BackupDto {
   createdAt?: string | null;
 }
 
-/** `settings_paths` 的返回；字段名容忍见 `settingsPathValue()`。 */
+/** `settings_paths` 的返回（字段名与 `commands.rs` 的 `SettingsPathsDto` 一致）。 */
 export interface SettingsPaths {
   configPath?: string | null;
   settingsPath?: string | null;
   backupsDir?: string | null;
   agentsDir?: string | null;
+  presetsUserPath?: string | null;
+  logsDir?: string | null;
 }
 
 // ---------------------------------------------------------------- 底层封装
@@ -504,14 +513,19 @@ export function backupLabel(backup: BackupDto): string {
   return "（未知文件）";
 }
 
-/** `settings_paths` 的任一字段；A4 未钉死字段名，故按候选键取值。 */
-export function settingsPathValue(paths: SettingsPaths | null, key: "config" | "settings" | "backups" | "agents"): string {
+/** `settings_paths` 的任一字段（键名与后端 `SettingsPathsDto` 一致）。 */
+export function settingsPathValue(
+  paths: SettingsPaths | null,
+  key: "config" | "settings" | "backups" | "agents" | "presets" | "logs",
+): string {
   if (!paths) return "";
   const table: Record<typeof key, Array<keyof SettingsPaths>> = {
     config: ["configPath"],
     settings: ["settingsPath"],
     backups: ["backupsDir"],
     agents: ["agentsDir"],
+    presets: ["presetsUserPath"],
+    logs: ["logsDir"],
   };
   for (const field of table[key]) {
     const value = paths[field];

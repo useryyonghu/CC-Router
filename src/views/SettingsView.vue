@@ -219,6 +219,8 @@ const backupsDir = computed(() => settingsPathValue(store.settingsPaths, "backup
 const configPath = computed(() => settingsPathValue(store.settingsPaths, "config"));
 const settingsPath = computed(() => settingsPathValue(store.settingsPaths, "settings"));
 const agentsDir = computed(() => settingsPathValue(store.settingsPaths, "agents"));
+const presetsUserPath = computed(() => settingsPathValue(store.settingsPaths, "presets"));
+const logsDir = computed(() => settingsPathValue(store.settingsPaths, "logs"));
 
 // ---------------------------------------------------------------- 导入 / 导出
 
@@ -418,6 +420,8 @@ onMounted(() => {
         { label: 'Claude Code settings.json', value: settingsPath },
         { label: '子 Agent 目录', value: agentsDir },
         { label: '备份目录', value: backupsDir },
+        { label: '预设用户覆盖文件', value: presetsUserPath },
+        { label: '日志目录', value: logsDir },
       ]" :key="item.label" class="path-row">
         <n-text depth="3" style="width: 220px">{{ item.label }}</n-text>
         <span class="mono path-value">{{ item.value || "（读取中）" }}</span>

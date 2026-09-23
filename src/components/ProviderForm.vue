@@ -67,7 +67,6 @@ const authStyleOptions = (["both", "x-api-key", "bearer"] as AuthStyle[]).map((s
 // ---------------------------------------------------------------- create
 
 const createDraft = reactive({
-  id: props.initial?.id ?? "",
   name: props.initial?.name ?? "",
   baseUrl: props.initial?.baseUrl ?? "",
   apiKey: "",
@@ -95,7 +94,6 @@ function create(fetchModels: boolean) {
         apiKey: createDraft.apiKey.trim(),
         authStyle: createDraft.authStyle,
       };
-      if (createDraft.id.trim()) dto.id = createDraft.id.trim();
       if (createDraft.name.trim()) dto.name = createDraft.name.trim();
       if (createDraft.modelsUrl.trim()) dto.modelsUrl = createDraft.modelsUrl.trim();
       if (props.preset) dto.presetId = props.preset.id;
@@ -167,10 +165,6 @@ function saveProvider() {
     message.error("该服务商已不存在（可能被删除），请关闭后重试");
     return Promise.resolve(false);
   }
-  if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(editDraft.id.trim())) {
-    message.warning("id 必须匹配 ^[a-z0-9][a-z0-9-]{0,31}$（小写字母、数字、连字符）");
-    return Promise.resolve(false);
-  }
   if (!editDraft.baseUrl.trim()) {
     message.warning("Base URL 不能为空");
     return Promise.resolve(false);
@@ -179,8 +173,9 @@ function saveProvider() {
     async () => {
       const next: Provider = {
         ...current,
-        id: editDraft.id.trim(),
-        name: editDraft.name.trim() || editDraft.id.trim(),
+        // id 只读：`provider_update` 按 id 定位（provider/mod.rs），改名必然报"不存在"。
+        id: current.id,
+        name: editDraft.name.trim() || current.id,
         baseUrl: editDraft.baseUrl.trim(),
         apiKey: editDraft.apiKey.trim(),
         authStyle: editDraft.authStyle,
@@ -382,15 +377,18 @@ const modelColumns = computed<DataTableColumns<ModelRow>>(() => [
 
     <n-space v-if="isCustom" style="margin-bottom: 12px">
       <n-button text type="primary" @click="showAdvanced = !showAdvanced">
-        {{ showAdvanced ? "收起高级选项" : "高级选项（id / 名称 / 鉴权方式 / 模型列表 URL）" }}
+        {{ showAdvanced ? "收起高级选项" : "高级选项（名称 / 鉴权方式 / 模型列表 URL）" }}
       </n-button>
     </n-space>
 
     <template v-if="showAdvanced">
-      <n-form-item label="id（留空则按域名自动推导，例如 api.moonshot.cn → moonshot）">
-        <n-input v-model:value="createDraft.id" placeholder="留空自动推导" />
-      </n-form-item>
-      <n-form-item label="名称（留空则用 id）">
+      <n-alert type="default" style="margin-bottom: 12px">
+        <span class="mono">id</span> 由 Base URL 的域名自动推导（例如
+        <span class="mono">api.moonshot.cn/anthropic → moonshot</span>，重名时自动加
+        <span class="mono">-2</span>）。后端不支持改名，所以这里不提供 id 输入框 ——
+        需要改名时请删除该服务商后重建（角色绑定会一并失效）。
+      </n-alert>
+      <n-form-item label="名称（留空则用 Base URL 的主机名）">
         <n-input v-model:value="createDraft.name" placeholder="留空自动推导" />
       </n-form-item>
       <n-form-item label="鉴权方式">
@@ -415,8 +413,8 @@ const modelColumns = computed<DataTableColumns<ModelRow>>(() => [
     <n-alert v-if="!provider" type="warning">该服务商已不存在，请关闭本窗口后刷新列表。</n-alert>
     <template v-else>
       <n-form label-placement="top" size="small">
-        <n-form-item label="id（改动会让引用它的角色绑定失效，请谨慎）">
-          <n-input v-model:value="editDraft.id" />
+        <n-form-item label="id（由 Base URL 推导，后端按 id 定位服务商 ⇒ 不支持改名）">
+          <n-input :value="editDraft.id" readonly />
         </n-form-item>
         <n-form-item label="名称">
           <n-input v-model:value="editDraft.name" />
