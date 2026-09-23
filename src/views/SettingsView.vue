@@ -3,7 +3,8 @@
  * B6：设置。
  *
  * - 端口（改后提示需重启网关 + 「立即重启网关」→ `gateway_restart`）、关窗行为、
- *   开机自启（Plan 4 才接真实注册，这里先只存配置）、退出时自动还原、请求日志落盘。
+ *   开机自启（`autostart_get` / `autostart_set`，**注册表为准**，见下方「开机自启」一节）、
+ *   退出时自动还原、请求日志落盘。
  * - 令牌：掩码显示 / 复制 / 重新生成（`token_regenerate`，会同步重写已接管的 Claude Code 配置）。
  * - 备份列表（`backups_list`）+ 备份目录路径复制；配置导入 / 导出（导出可选移除密钥）。
  * - 关于：版本、来源 farion1231/cc-switch 与 **MIT 许可证全文**（`src/constants.ts`）。
@@ -43,7 +44,6 @@ const { confirm } = useConfirm();
 
 const port = ref<number | null>(null);
 const closeToTray = ref(true);
-const autostart = ref(true);
 const restoreOnExit = ref(false);
 const requestLogToFile = ref(false);
 
@@ -53,12 +53,14 @@ const requestLogToFile = ref(false);
  * 原来监听整个 `store.config` 对象：任何一次 refreshConfig()（例如在同一个页面里
  * 「重新生成令牌」「导入配置」）都会把用户还没保存的端口 / 开关改动弹回旧值。
  * 这里逐字段监听原始值 —— 与这些字段无关的刷新不再动草稿。
+ *
+ * **`ui.autostart` 不在这个 watcher 里**：它不是草稿，而是一个立即动作，
+ * 真相在注册表（见下面「开机自启」一节）。用配置镜像去灌它会多出第二条真相来源。
  */
 watch(
   [
     () => store.config?.gateway.port ?? null,
     () => store.config?.ui.closeToTray ?? null,
-    () => store.config?.ui.autostart ?? null,
     () => store.config?.ui.restoreOnExit ?? null,
     () => store.config?.ui.requestLogToFile ?? null,
   ],
@@ -67,12 +69,85 @@ watch(
     if (!config) return;
     port.value = config.gateway.port;
     closeToTray.value = config.ui.closeToTray;
-    autostart.value = config.ui.autostart;
     restoreOnExit.value = config.ui.restoreOnExit;
     requestLogToFile.value = config.ui.requestLogToFile;
   },
   { immediate: true },
 );
+
+// ---------------------------------------------------------------- 开机自启（注册表为准）
+
+/**
+ * 「开机自启」开关**不是草稿，而是一个立即动作**：真相在 Windows 注册表里
+ * （`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下的 `CC Router`），
+ * `config.json` 的 `ui.autostart` 只是它的**镜像**。
+ *
+ * 契约（已裁决，勿改）：
+ *  1. 注册表是唯一事实来源；前端**绝不**拿配置去反写注册表。
+ *  2. 注册表**只在用户拨动这个开关时**改变 —— 启动时不写，`saveSettings()` 时也不写
+ *     （它只把当前值放进 payload，等于把镜像写成镜像自身的值，不改变系统状态）。
+ *     理由：`ui.autostart` 的默认值是 `true`。若改成「启动时按配置对齐注册表」，
+ *     用户只是打开一次应用，机器上就会被静默加上一条开机自启项 —— 一个用户没要求的系统级副作用。
+ *  3. 所以开关在挂载时用 `autostart_get()`（读注册表）初始化，而不是读 `store.config.ui.autostart`；
+ *     拨动失败时以注册表实测值回滚。界面永远显示系统真实状态，不会出现「显示开着、其实没写进去」。
+ *
+ * 代价（有意为之）：手改 `config.json` 里的 `autostart` 字段不会改变系统状态 ——
+ * 一个数据文件不应该悄悄改动机器的启动项。
+ */
+const autostart = ref(true);
+/** 最近一次从注册表读到的实测值：`autostart_set` 失败且再读也读不回来时的兜底。 */
+let autostartObserved: boolean | null = null;
+/** 首次读注册表还没回来：此时开关显示 loading（naive-ui 的 Switch 在 loading 时忽略点击），
+ *  免得在真相未知时先亮一个「开」。 */
+const autostartLoading = ref(true);
+
+/**
+ * 读注册表真相并同步到开关。
+ * `notify` 为 false 时不弹错 —— 失败回滚路径上已经弹过一条主错误，避免同一件事弹两次。
+ */
+async function readAutostart(notify: boolean): Promise<boolean | null> {
+  try {
+    const enabled = await ipc.autostartGet();
+    autostartObserved = enabled;
+    autostart.value = enabled;
+    return enabled;
+  } catch (err) {
+    if (notify) {
+      message.error(`读取开机自启状态失败：${errorText(err)}`, { duration: 8000, closable: true });
+    }
+    return null;
+  }
+}
+
+/** 用户拨动开关：立即写注册表，并以后端的**实测**返回值为准。 */
+async function changeAutostart(next: boolean): Promise<void> {
+  const previous = autostart.value;
+  autostart.value = next; // 先给即时反馈，避免开关「按不动」；失败时下面会回滚
+  const ok = await run(
+    async () => {
+      autostart.value = await ipc.autostartSet(next);
+    },
+    next ? "已开启开机自启" : "已关闭开机自启",
+    "autostart",
+  );
+  if (ok) {
+    autostartObserved = autostart.value;
+    return;
+  }
+  // 失败：`run` 已经弹出后端错误文本（spec §5.7 不允许静默失败）。
+  // 但开关绝不能停在「开」而注册表说「关」：以注册表实测值回滚；
+  // 实测值也读不回来时，退回上一次实测值，最后才退回拨动前的值。
+  const observed = await readAutostart(false);
+  if (observed === null) autostart.value = autostartObserved ?? previous;
+}
+
+async function initAutostart(): Promise<void> {
+  try {
+    await readAutostart(true);
+  } finally {
+    autostartLoading.value = false;
+  }
+}
 
 /**
  * 「立即重启网关」只在**已经保存的端口**与运行中的网关端口不一致时出现（M5）。
@@ -311,6 +386,7 @@ async function onImportFile(event: Event): Promise<void> {
 }
 
 onMounted(() => {
+  void initAutostart();
   void loadBackups();
   if (!store.settingsPaths) void store.refreshPaths();
   if (!store.appVersion) void store.refreshVersion();
@@ -354,9 +430,15 @@ onMounted(() => {
           <n-text>关闭窗口时最小化到托盘（关闭 = 直接退出）</n-text>
         </n-space>
         <n-space align="center" :size="10">
-          <n-switch v-model:value="autostart" size="small" />
+          <n-switch
+            :value="autostart"
+            :loading="autostartLoading || isBusy('autostart')"
+            size="small"
+            @update:value="changeAutostart"
+          />
           <n-text>开机自启</n-text>
-          <n-tag size="small" type="warning">真实注册在后续计划接入，当前只保存配置</n-tag>
+          <n-tag size="small" type="success">拨动即写入注册表</n-tag>
+          <n-text depth="3">以注册表为准；手改 config.json 的 autostart 不会改变系统启动项</n-text>
         </n-space>
         <n-space align="center" :size="10">
           <n-switch v-model:value="restoreOnExit" size="small" />

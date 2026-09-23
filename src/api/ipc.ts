@@ -329,6 +329,33 @@ export function recentLogs(limit = 200): Promise<LogEntry[]> {
   return call<LogEntry[]>("recent_logs", { limit });
 }
 
+// ---------------------------------------------------------------- 开机自启（Plan 4 T3）
+
+/**
+ * 开机自启的**唯一事实来源是 Windows 注册表**：
+ * `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 下名为 `CC Router` 的值。
+ * `config.json` 的 `ui.autostart`（见上面的 `UiConfig`）只是它的**镜像**。
+ *
+ * 因此这里只声明「读注册表」与「写注册表」两个动作，**没有**任何拿配置反写注册表的封装：
+ * 注册表只在用户拨动设置页那个开关时改变（启动时不写、保存配置时也不写）。
+ * 理由：`ui.autostart` 的默认值是 `true`，若做成「启动时按配置对齐注册表」，
+ * 用户只是打开一次应用，机器上就会被静默加上一条开机自启项 —— 用户没要求的系统级副作用。
+ *
+ * 后端（`autostart.rs`）以注册表实测值同步 `ui.autostart`，所以 `getConfig()` 拿到的
+ * `ui.autostart` 也是注册表真相；前端不需要、也不允许再做一次对齐。
+ */
+export function autostartGet(): Promise<boolean> {
+  return call<boolean>("autostart_get");
+}
+
+/**
+ * 写入 / 删除开机自启项，返回**实测**状态（注册表写完后再读一次，而不是回显入参）：
+ * 后端可能因为权限或注册表被改而无效果，回显入参就会让开关撒谎。
+ */
+export function autostartSet(enabled: boolean): Promise<boolean> {
+  return call<boolean>("autostart_set", { enabled });
+}
+
 // ---------------------------------------------------------------- 接管（spec §7）
 
 export function takeoverStatus(): Promise<TakeoverStatus> {

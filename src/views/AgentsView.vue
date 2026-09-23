@@ -48,6 +48,12 @@ interface RowState {
 }
 const rowState = reactive<Record<string, RowState>>({});
 
+/**
+ * 每行**磁盘上的 `model` 值**（trim 后；空串 = 没有 `model` 行）。
+ * 它是「这一行的模型选择是否已经在磁盘上落定」的身份指纹 —— M10 同类修复用。
+ */
+const diskModel = new Map<string, string>();
+
 const CHOICE_OPTIONS = [
   { label: "跟随主模型（inherit）", value: "inherit" },
   { label: "使用 subagent 默认", value: "subagent_default" },
@@ -58,17 +64,56 @@ function fileName(path: string): string {
   return path.split(/[\\/]/).pop() ?? path;
 }
 
+/** 从一行磁盘数据推出它对应的选择 / 目标。 */
+function rowStateFromDisk(agent: AgentInfo): RowState {
+  const model = agent.model?.trim() ? agent.model.trim() : null;
+  let choice: AgentModelChoice = "subagent_default";
+  if (model) choice = model.toLowerCase() === "inherit" ? "inherit" : "alias";
+  const matched = choice === "alias" ? store.modelByAlias(model) : null;
+  return {
+    choice,
+    target: matched ? { providerId: matched.providerId, modelId: matched.modelId } : null,
+  };
+}
+
+/** 磁盘指纹（`agent.model` 的归一化值）。 */
+function modelSignature(agent: AgentInfo): string {
+  return agent.model?.trim() ?? "";
+}
+
+/**
+ * **按身份合并**，而不是整体覆盖（M10 同类修复，与 RolesView / SettingsView 同一套做法）。
+ *
+ * 行身份 = `agent.path`（`rowState` 的键，也是表格的 `row-key`）；
+ * 是否需要重灌 = 该行**磁盘上的 `model` 值**是否真的变了。于是：
+ *  - 用户选了「指定模型」但还没挑具体模型（`changeChoice` 有意不落盘）：磁盘没变
+ *    ⇒ 保留草稿对象，点「刷新」或去改别的行都不会再把它打回磁盘值；
+ *  - 这一行的 `model` 真的在磁盘上变了（本页写盘、或外部改文件）：指纹不同
+ *    ⇒ 重灌为磁盘真值，界面跟着上游走，磁盘的新值不会被旧草稿悄悄盖掉；
+ *  - 列表里不再存在的行：连同指纹一起清掉，不留残留。
+ */
 function syncRows(): void {
+  const seen = new Set<string>();
   for (const agent of agents.value) {
-    const model = agent.model?.trim() ? agent.model.trim() : null;
-    let choice: AgentModelChoice = "subagent_default";
-    if (model) choice = model.toLowerCase() === "inherit" ? "inherit" : "alias";
-    const matched = choice === "alias" ? store.modelByAlias(model) : null;
-    rowState[agent.path] = {
-      choice,
-      target: matched ? { providerId: matched.providerId, modelId: matched.modelId } : null,
-    };
+    seen.add(agent.path);
+    const signature = modelSignature(agent);
+    if (rowState[agent.path] && diskModel.get(agent.path) === signature) continue;
+    diskModel.set(agent.path, signature);
+    rowState[agent.path] = rowStateFromDisk(agent);
   }
+  for (const path of Object.keys(rowState)) {
+    if (seen.has(path)) continue;
+    delete rowState[path];
+    diskModel.delete(path);
+  }
+}
+
+/** 把某一行强制拉回磁盘真值（写盘失败时用：那次乐观选择并没有落到 frontmatter 上）。 */
+function resetRowFromDisk(path: string): void {
+  const agent = agents.value.find((item) => item.path === path);
+  if (!agent) return;
+  diskModel.set(path, modelSignature(agent));
+  rowState[path] = rowStateFromDisk(agent);
 }
 
 async function load(): Promise<void> {
@@ -97,8 +142,12 @@ function effectText(agent: AgentInfo): string {
   return `指定别名 ${model}（不在本应用当前配置里，网关可能不识别）`;
 }
 
-function setModel(agent: AgentInfo, choice: AgentModelChoice, alias: string | null) {
-  return run(
+async function setModel(
+  agent: AgentInfo,
+  choice: AgentModelChoice,
+  alias: string | null,
+): Promise<boolean> {
+  const ok = await run(
     async () => {
       await ipc.agentSetModel(agent.path, choice, alias);
       await load();
@@ -106,6 +155,13 @@ function setModel(agent: AgentInfo, choice: AgentModelChoice, alias: string | nu
     `已更新 ${fileName(agent.path)} 的模型`,
     `agent-${agent.path}`,
   );
+  if (ok) return true;
+  // 写盘失败：`run` 已经弹错（spec §5.7 不允许静默失败），而这次选择**并没有**落到 frontmatter 上。
+  // 按身份合并的 syncRows 会把这份乐观选择当成"用户草稿"保留下来 —— 那会让行内选择
+  // 显示一个磁盘上并不存在的值，所以这里显式拉回磁盘真值。
+  await load();
+  resetRowFromDisk(agent.path);
+  return false;
 }
 
 function changeChoice(agent: AgentInfo, choice: AgentModelChoice): void {

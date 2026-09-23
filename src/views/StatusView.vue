@@ -32,7 +32,7 @@ import { useConfigStore } from "../stores/config";
 const emit = defineEmits<{ navigate: [PageKey] }>();
 
 const store = useConfigStore();
-const { busy, isBusy, run } = useAction();
+const { isBusy, run } = useAction();
 const { confirm } = useConfirm();
 
 const ROLE_LABELS: Record<RoleName, string> = {
@@ -374,8 +374,17 @@ function logRowProps(row: LogEntry) {
             而不是本机网关 <span class="mono">{{ store.takeover?.gatewayUrl }}</span>。
           </div>
           <n-space style="margin-top: 8px">
-            <n-button size="small" type="primary" :loading="busy" @click="applyTakeover">重新接管</n-button>
-            <n-button size="small" @click="restoreTakeover">还原</n-button>
+            <n-button
+              size="small"
+              type="primary"
+              :loading="isBusy('takeover-apply')"
+              @click="applyTakeover"
+            >
+              重新接管
+            </n-button>
+            <n-button size="small" :loading="isBusy('takeover-restore')" @click="restoreTakeover">
+              还原
+            </n-button>
           </n-space>
         </n-alert>
       </n-gi>
