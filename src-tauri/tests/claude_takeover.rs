@@ -4,6 +4,10 @@
 //! 所有夹具都在 `tempfile::tempdir()` 里构造，**绝不触碰真实的 `~/.claude/`**；
 //! 需要路径的地方一律显式传入，绝不调用 `claude_settings_path()` / `agents_dir()`。
 
+use cc_router::claude::agents::{
+    create_agent, delete_agent, list_agents, restore_agent, set_model, set_model_recorded,
+    ModelChoice,
+};
 use cc_router::claude::settings::{
     apply_takeover, apply_takeover_at, build_env_updates, restore, takeover_state, RestorePath,
     TakeoverState as FileState, REMOVED_KEYS,
@@ -408,3 +412,238 @@ fn restore_falls_back_to_manifest_when_backups_are_gone() {
     // 因此这条路径在这个夹具上也逐字节相等（但 AC8 的保证来自 Verbatim 路径）。
     assert_eq!(fs::read(&path).unwrap(), before);
 }
+
+// ---------------------------------------------------------------- Task 3
+
+/// 一个带 frontmatter 与正文的普通子 Agent 文件（LF）。
+const AGENT_LF: &str = "---\nname: reviewer\ndescription: 代码审查\n---\n\n你是审查者。\n";
+
+/// CRLF + 末尾**没有**换行：还原能否逐字节相等全看这一条。
+const AGENT_CRLF_NO_TRAILING: &str =
+    "---\r\nname: crlf-agent\r\ndescription: 换行风格测试\r\n---\r\nbody without trailing newline";
+
+/// 完全没有 frontmatter 的文件。
+const AGENT_NO_FRONTMATTER: &str = "# 纯正文\n\n没有 frontmatter 的 agent 文件。\n";
+
+/// 去掉所有 `model:` 行后的文本（用于证明"只有 model 行变了"）。
+fn without_model_lines(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.trim_end_matches('\r').starts_with("model:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn read_text(path: &Path) -> String {
+    String::from_utf8(fs::read(path).unwrap()).unwrap()
+}
+
+#[test]
+fn set_model_replace_insert_remove() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reviewer.md");
+    let backups = dir.path().join("backups");
+    fs::write(&path, AGENT_LF).unwrap();
+
+    // 插入（原本没有 model 行）
+    set_model(&path, ModelChoice::Alias("ccr-kimi-k3"), &backups).unwrap();
+    let inserted = read_text(&path);
+    assert!(inserted.contains("model: ccr-kimi-k3\n"), "{inserted}");
+    assert_eq!(
+        without_model_lines(&inserted),
+        without_model_lines(AGENT_LF),
+        "插入只允许影响 model 行"
+    );
+
+    // 替换
+    set_model(&path, ModelChoice::Inherit, &backups).unwrap();
+    let replaced = read_text(&path);
+    assert!(replaced.contains("model: inherit\n"), "{replaced}");
+    assert!(!replaced.contains("ccr-kimi-k3"));
+    assert_eq!(without_model_lines(&replaced), without_model_lines(AGENT_LF));
+
+    // 删除
+    set_model(&path, ModelChoice::SubagentDefault, &backups).unwrap();
+    assert_eq!(read_text(&path), AGENT_LF, "删掉 model 行后必须回到原样");
+}
+
+#[test]
+fn set_model_preserves_crlf_and_trailing_newline() {
+    let dir = tempfile::tempdir().unwrap();
+    let backups = dir.path().join("backups");
+
+    // CRLF + 无末尾换行
+    let crlf = dir.path().join("crlf.md");
+    fs::write(&crlf, AGENT_CRLF_NO_TRAILING).unwrap();
+    set_model(&crlf, ModelChoice::Alias("ccr-x"), &backups).unwrap();
+    let text = read_text(&crlf);
+    assert!(text.contains("model: ccr-x\r\n"), "插入的行必须用 CRLF: {text:?}");
+    assert!(!text.ends_with('\n'), "末尾无换行必须保持: {text:?}");
+    assert_eq!(text.replace("model: ccr-x\r\n", ""), AGENT_CRLF_NO_TRAILING);
+
+    // LF + 有末尾换行
+    let lf = dir.path().join("lf.md");
+    fs::write(&lf, AGENT_LF).unwrap();
+    set_model(&lf, ModelChoice::Alias("ccr-x"), &backups).unwrap();
+    let text = read_text(&lf);
+    assert!(text.contains("model: ccr-x\n"));
+    assert!(!text.contains('\r'), "不得把 LF 文件改成 CRLF: {text:?}");
+    assert!(text.ends_with('\n'), "末尾换行必须保持");
+    assert_eq!(text.replace("model: ccr-x\n", ""), AGENT_LF);
+}
+
+#[test]
+fn set_model_preserves_other_frontmatter_and_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tools.md");
+    let backups = dir.path().join("backups");
+    let original = "---\nname: r\ndescription: d\ntools: Read, Grep\nmodel: old-alias\n---\n\nSome body\n---\nnot frontmatter\n- list item\n";
+    fs::write(&path, original).unwrap();
+
+    set_model(&path, ModelChoice::Alias("ccr-new"), &backups).unwrap();
+    let text = read_text(&path);
+    assert!(text.contains("tools: Read, Grep"));
+    assert!(text.contains("description: d"));
+    assert!(text.contains("\n---\nnot frontmatter\n- list item\n"), "正文里的 --- 与连字符行不得被当成 frontmatter");
+    assert_eq!(text.replace("model: ccr-new", "model: old-alias"), original);
+}
+
+#[test]
+fn agent_round_trip_is_byte_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let backups = dir.path().join("backups");
+
+    for (i, original) in [AGENT_LF, AGENT_CRLF_NO_TRAILING, AGENT_NO_FRONTMATTER]
+        .into_iter()
+        .enumerate()
+    {
+        let path = dir.path().join(format!("agent{i}.md"));
+        fs::write(&path, original).unwrap();
+        let entry = set_model_recorded(&path, ModelChoice::Alias("ccr-kimi-k3"), &backups).unwrap();
+        assert!(entry.existed && entry.backup_file.is_some());
+        restore_agent(&entry, &backups).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original.as_bytes(),
+            "case {i} 必须逐字节还原"
+        );
+    }
+}
+
+/// 备份被清理掉时，还原清单本身必须仍然足够精确 —— 否则 spec §8.3 的"还原清单"
+/// 就只是备份的别名，而备份是会被清理的。
+#[test]
+fn restore_agent_reconstructs_when_backup_is_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let backups = dir.path().join("backups");
+
+    for (i, original) in [AGENT_LF, AGENT_CRLF_NO_TRAILING, AGENT_NO_FRONTMATTER]
+        .into_iter()
+        .enumerate()
+    {
+        let path = dir.path().join(format!("no-bak{i}.md"));
+        fs::write(&path, original).unwrap();
+        let entry = set_model_recorded(&path, ModelChoice::Alias("ccr-kimi-k3"), &backups).unwrap();
+        fs::remove_file(backups.join(entry.backup_file.as_ref().unwrap())).unwrap();
+
+        restore_agent(&entry, &backups).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original.as_bytes(),
+            "case {i} 必须仅凭清单逐字节还原"
+        );
+    }
+}
+
+#[test]
+fn create_then_delete_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let agents = dir.path().join("agents");
+    let backups = dir.path().join("backups");
+
+    let path = create_agent(
+        &agents,
+        "code-reviewer",
+        "审查代码",
+        ModelChoice::Alias("ccr-kimi-k3"),
+        "你是代码审查专家。\n",
+        &backups,
+    )
+    .unwrap();
+    assert_eq!(path, agents.join("code-reviewer.md"));
+    let text = read_text(&path);
+    assert!(text.starts_with("---\n"), "{text:?}");
+    assert!(text.contains("name: code-reviewer\n"));
+    assert!(text.contains("description: 审查代码\n"));
+    assert!(text.contains("model: ccr-kimi-k3\n"));
+    assert!(text.ends_with("你是代码审查专家。\n"));
+
+    delete_agent(&path, &backups).unwrap();
+    assert!(!path.exists());
+    let baks: Vec<String> = fs::read_dir(backups.join("agents"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        baks.iter().any(|n| n.starts_with("code-reviewer.md.") && n.ends_with(".bak")),
+        "删除前必须先备份: {baks:?}"
+    );
+}
+
+#[test]
+fn list_agents_is_recursive_and_sorted() {
+    let dir = tempfile::tempdir().unwrap();
+    let agents = dir.path().join("agents");
+    fs::create_dir_all(agents.join("z-sub")).unwrap();
+    fs::create_dir_all(agents.join("a-sub")).unwrap();
+    fs::write(agents.join("z-sub/one.md"), "---\nname: One\n---\n正文\n").unwrap();
+    fs::write(agents.join("a-sub/two.md"), "---\nname: Two\nmodel: ccr-x\n---\n正文\n").unwrap();
+    fs::write(agents.join("top.md"), "---\nname: Top\ndescription: 顶层\n---\n正文\n").unwrap();
+    fs::write(agents.join("ignore.txt"), "not markdown").unwrap();
+
+    let list = list_agents(&agents).unwrap();
+    assert_eq!(list.len(), 3, "必须递归列出 **/*.md，且忽略非 .md: {list:?}");
+    assert!(
+        list.windows(2).all(|w| w[0].path <= w[1].path),
+        "必须按路径排序: {:?}",
+        list.iter().map(|a| &a.path).collect::<Vec<_>>()
+    );
+    let one = list.iter().find(|a| a.name.as_deref() == Some("One")).unwrap();
+    assert_eq!(one.model, None);
+    assert_eq!(one.model_line, None);
+    let two = list.iter().find(|a| a.name.as_deref() == Some("Two")).unwrap();
+    assert_eq!(two.model.as_deref(), Some("ccr-x"));
+    assert_eq!(two.model_line, Some(3), "model 行在第 3 行（1 起）");
+    let top = list.iter().find(|a| a.name.as_deref() == Some("Top")).unwrap();
+    assert_eq!(top.description.as_deref(), Some("顶层"));
+    assert_eq!(top.model, None);
+
+    // 目录不存在时返回空表，而不是报错（首次使用时 agents/ 目录可能还没有）
+    assert!(list_agents(&dir.path().join("nope")).unwrap().is_empty());
+}
+
+#[test]
+fn no_frontmatter_file_gains_one_for_alias_but_not_for_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let backups = dir.path().join("backups");
+
+    let path = dir.path().join("plain.md");
+    fs::write(&path, AGENT_NO_FRONTMATTER).unwrap();
+    set_model(&path, ModelChoice::Alias("ccr-kimi-k3"), &backups).unwrap();
+    let text = read_text(&path);
+    let expected_prefix = "---\nname: plain\nmodel: ccr-kimi-k3\n---\n";
+    assert!(text.starts_with(expected_prefix), "{text:?}");
+    assert!(text.ends_with(AGENT_NO_FRONTMATTER), "正文必须原样保留");
+
+    let also = dir.path().join("plain-inherit.md");
+    fs::write(&also, AGENT_NO_FRONTMATTER).unwrap();
+    set_model(&also, ModelChoice::Inherit, &backups).unwrap();
+    assert!(read_text(&also).starts_with("---\nname: plain-inherit\nmodel: inherit\n---\n"));
+
+    // SubagentDefault：没有 model 行可删 → 一个字节都不改
+    let untouched = dir.path().join("plain-default.md");
+    fs::write(&untouched, AGENT_NO_FRONTMATTER).unwrap();
+    set_model(&untouched, ModelChoice::SubagentDefault, &backups).unwrap();
+    assert_eq!(fs::read(&untouched).unwrap(), AGENT_NO_FRONTMATTER.as_bytes());
+}
+
