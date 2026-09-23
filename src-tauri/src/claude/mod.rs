@@ -23,7 +23,12 @@ pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     name.push(format!(".tmp.{}.{}", std::process::id(), n));
     let tmp = path.with_file_name(name);
     std::fs::write(&tmp, bytes).map_err(|e| Error::io(tmp.clone(), e))?;
-    std::fs::rename(&tmp, path).map_err(|e| Error::io(path.to_path_buf(), e))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // rename 失败时临时文件会留在**目标文件所在目录**（接管场景就是 `~/.claude/`）。
+        // 必须清掉，否则会在用户配置目录里不断堆积垃圾。
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Error::io(path.to_path_buf(), e));
+    }
     Ok(())
 }
 
@@ -58,5 +63,30 @@ mod tests {
         atomic_write_bytes(&path, b"one").unwrap();
         atomic_write_bytes(&path, b"two").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"two");
+    }
+
+    /// rename 失败时临时文件会落在**目标文件所在目录**（接管场景就是 `~/.claude/`），
+    /// 必须清掉 —— 否则用户配置目录里会不断堆积 `settings.json.tmp.*` 垃圾。
+    /// 用"目标是一个目录"来稳定地制造 rename 失败（Windows/Unix 都会失败）。
+    #[test]
+    fn atomic_write_bytes_cleans_up_temp_when_rename_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::create_dir(&path).unwrap();
+
+        let err = atomic_write_bytes(&path, b"x").unwrap_err();
+        assert!(matches!(err, Error::Io { .. }), "必须是 IO 错误: {err:?}");
+        assert!(path.is_dir(), "失败时不得破坏原目标");
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "rename 失败时临时文件必须被清掉: {leftovers:?}"
+        );
     }
 }

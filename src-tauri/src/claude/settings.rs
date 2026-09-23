@@ -262,9 +262,11 @@ pub fn apply_takeover_at(
     if file_existed {
         write_if_absent(&backups_dir.join(&pre_bytes_file), &before)?;
     }
-    atomic_write_bytes(settings_path, &after)?;
-    // post 必须反映"我们最后写出的字节"，因此总是覆盖。
+    // **post 必须先于 settings.json 落盘**：post 既是"我们写出的字节"的凭据，也是还原判据。
+    // 若反过来，settings.json 写成功后 post 写失败，就会留下"文件已被接管、却没有任何还原
+    // 依据"的状态 —— 清单要到本函数返回 Ok 之后才由上层落盘。post 总是覆盖。
     atomic_write_bytes(&backups_dir.join(&post_bytes_file), &after)?;
+    atomic_write_bytes(settings_path, &after)?;
 
     Ok(TakeoverManifest {
         applied_at: chrono::Local::now().to_rfc3339(),
@@ -292,8 +294,18 @@ pub fn restore(
 
     let unmodified = post.as_deref() == Some(current.as_slice());
     let (target, path) = if !manifest.file_existed {
-        // 接管前整个文件都不存在 → 还原就是"删掉它"（spec §7.3）。
-        (None, if unmodified { RestorePath::Verbatim } else { RestorePath::MergedManifest })
+        // 接管前整个文件都不存在 → 这个文件完全是我们创建的，还原就是"删掉它"（spec §7.3）。
+        // 但若接管后被外部改动过，删除就会毁掉别人的内容 —— 那种情况必须**拒绝**，
+        // 且绝不能把它谎报成"合并式回放（MergedManifest）"。
+        if settings_path.exists() && !unmodified {
+            return Err(Error::ConfigInvalid(format!(
+                "接管前 {} 并不存在，但接管后它被外部改动过；还原会删除这些内容，已拒绝执行。\
+                 请先人工核对（我们写出的版本在 {}），确认可以丢弃后再删除该文件并重试。",
+                settings_path.display(),
+                backups_dir.join(&manifest.post_bytes_file).display()
+            )));
+        }
+        (None, RestorePath::Verbatim)
     } else if unmodified && pre.is_some() {
         (pre, RestorePath::Verbatim)
     } else {
@@ -364,6 +376,16 @@ fn merged_replay(
     })?;
 
     let needs_env = manifest.keys.values().any(|s| s.existed && s.value.is_some());
+    // `env` 存在但不是对象：合并式回放**无法**执行。绝不能静默跳过 —— 那会让调用方
+    // 以为"所有键都还原了"（changed_keys 还会显示"无事发生"），而实际上是**一个键都没还原**。
+    if let Some(value) = obj.get("env") {
+        if !value.is_object() {
+            return Err(Error::ConfigInvalid(format!(
+                "{} 的 env 不是 JSON 对象，无法做合并式还原；请用 backups 目录里的 *.pre.bak 手工恢复",
+                settings_path.display()
+            )));
+        }
+    }
     if needs_env && !obj.contains_key("env") {
         obj.insert("env".to_string(), Value::Object(Map::new()));
     }

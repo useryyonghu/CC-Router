@@ -141,6 +141,19 @@ pub fn set_model_recorded(
     choice: ModelChoice<'_>,
     backups_dir: &Path,
 ) -> Result<AgentManifestEntry> {
+    set_model_recorded_at(path, choice, backups_dir, &super::backup_stamp())
+}
+
+/// 与 [`set_model_recorded`] 相同，但可显式指定备份时间戳。
+///
+/// 存在的理由与 `settings::apply_takeover_at` 一样：只有能固定 stamp，才能确定性地测出
+/// "两个不同目录下的同名文件在同一次操作里不得共用备份" 这条不变量。
+pub fn set_model_recorded_at(
+    path: &Path,
+    choice: ModelChoice<'_>,
+    backups_dir: &Path,
+    stamp: &str,
+) -> Result<AgentManifestEntry> {
     let original = read_text(path)?;
     let lines = split_lines(&original);
     let frontmatter = frontmatter_range(&lines);
@@ -163,7 +176,7 @@ pub fn set_model_recorded(
         return Ok(entry);
     }
 
-    let backup_file = write_backup_once(path, original.as_bytes(), backups_dir)?;
+    let backup_file = write_backup_once(path, original.as_bytes(), backups_dir, stamp)?;
     atomic_write_bytes(path, rewritten.as_bytes())?;
     Ok(AgentManifestEntry { backup_file: Some(backup_file), ..entry })
 }
@@ -198,8 +211,13 @@ pub fn create_agent(
 
 /// 删除子 Agent：**先备份再删除**（spec §8.2）。
 pub fn delete_agent(path: &Path, backups_dir: &Path) -> Result<()> {
+    delete_agent_at(path, backups_dir, &super::backup_stamp())
+}
+
+/// 与 [`delete_agent`] 相同，但可显式指定备份时间戳（理由见 [`set_model_recorded_at`]）。
+pub fn delete_agent_at(path: &Path, backups_dir: &Path, stamp: &str) -> Result<()> {
     let bytes = std::fs::read(path).map_err(|e| Error::io(path.to_path_buf(), e))?;
-    write_backup_once(path, &bytes, backups_dir)?;
+    write_backup_once(path, &bytes, backups_dir, stamp)?;
     std::fs::remove_file(path).map_err(|e| Error::io(path.to_path_buf(), e))
 }
 
@@ -209,7 +227,7 @@ pub fn restore_agent(entry: &AgentManifestEntry, backups_dir: &Path) -> Result<(
         // 我们新建的文件：先备份再删除，绝不无声销毁。
         if entry.path.exists() {
             let bytes = std::fs::read(&entry.path).map_err(|e| Error::io(entry.path.clone(), e))?;
-            write_backup_once(&entry.path, &bytes, backups_dir)?;
+            write_backup_once(&entry.path, &bytes, backups_dir, &super::backup_stamp())?;
             std::fs::remove_file(&entry.path).map_err(|e| Error::io(entry.path.clone(), e))?;
         }
         return Ok(());
@@ -242,6 +260,31 @@ fn validate_agent_name(name: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// 纵深防御（spec §9）：确认 `candidate` 真的落在 `agents_dir` 之内。
+///
+/// IPC 只往这里传前端给的路径字符串，若不校验，一个拼接错误的路径就能改写/删除用户
+/// 任意可写文件。**两侧都先 canonicalize**，因此下面三类逃逸都会被拒：
+/// `..` 回退、指向别处的绝对路径、符号链接/junction 跳转。
+///
+/// `candidate` 必须存在（canonicalize 需要真实文件）——本函数服务于"改/删已存在的子 Agent"，
+/// 新建路径由 [`create_agent`] 自己从 `agents_dir` 拼出。`agents_dir` 不存在时同样报错
+/// （边界无法确立 → fail-closed）。
+pub fn ensure_within_agents_dir(agents_dir: &Path, candidate: &Path) -> Result<()> {
+    let root = agents_dir.canonicalize().map_err(|e| Error::io(agents_dir.to_path_buf(), e))?;
+    let target = candidate
+        .canonicalize()
+        .map_err(|e| Error::io(candidate.to_path_buf(), e))?;
+    if target.starts_with(&root) {
+        Ok(())
+    } else {
+        Err(Error::ConfigInvalid(format!(
+            "拒绝操作 {}：它不在子 Agent 目录 {} 之内",
+            candidate.display(),
+            agents_dir.display()
+        )))
+    }
 }
 
 // ------------------------------------------------------------ 文本手术
@@ -415,17 +458,145 @@ fn looks_like_inserted_block(lines: &[&str]) -> bool {
         && line_body(lines[3]) == "---"
 }
 
+/// 备份键：以**规范化的完整路径**为依据，而不是裸文件名。
+///
+/// 子 Agent 目录是递归的（spec §8.1）：`alpha/reviewer.md` 与 `beta/reviewer.md` 若都按
+/// `reviewer.md` 命名，第二次备份会被 write-if-absent 静默跳过，而两次的清单记录指向同一个
+/// 备份文件 —— 还原时会把 alpha 的字节写进 beta，且 beta 的原文从未被备份（不可恢复）。
+fn backup_name(path: &Path, stamp: &str) -> String {
+    // canonicalize 让同一文件的不同写法（大小写、`..`、符号链接）落到同一个键上，
+    // 使"同一文件同一 stamp 只备份一次"仍然成立。
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let raw = resolved.to_string_lossy().to_string();
+    let text = raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string();
+
+    let mut flat = String::with_capacity(text.len());
+    for ch in text.chars() {
+        // 非 ASCII 字符也替换成 '_'：结果保证是纯 ASCII，后面按字节切片才安全。
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            flat.push(ch);
+        } else {
+            flat.push('_');
+        }
+    }
+    if flat.len() > 120 {
+        // 文件名长度上限（Windows 255）：保留信息量最大的尾部，并附**完整路径**的哈希
+        // 以保证截断后仍然唯一。
+        let tail = flat[flat.len() - 80..].to_string();
+        flat = format!("{tail}-{}", fnv1a_hex16(&text));
+    }
+    format!("agents/{flat}.{stamp}.bak")
+}
+
+fn fnv1a_hex16(input: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in input.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 /// 备份一次：同一个 `(文件, 时间戳)` 只备份一次，绝不覆盖已有备份
 /// （覆盖会把"已改动的内容"当成原始状态）。
-fn write_backup_once(path: &Path, bytes: &[u8], backups_root: &Path) -> Result<String> {
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .ok_or_else(|| Error::ConfigInvalid(format!("无法取文件名：{}", path.display())))?;
-    let relative = format!("agents/{file_name}.{}.bak", super::backup_stamp());
+fn write_backup_once(path: &Path, bytes: &[u8], backups_root: &Path, stamp: &str) -> Result<String> {
+    let relative = backup_name(path, stamp);
     let full = backups_root.join(&relative);
     if !full.exists() {
         atomic_write_bytes(&full, bytes)?;
     }
     Ok(relative)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 备份键必须**按路径**区分同名文件，且长度受控。
+    #[test]
+    fn backup_name_is_unique_per_path_and_length_bounded() {
+        let a = Path::new(r"C:\x\agents\alpha\reviewer.md");
+        let b = Path::new(r"C:\x\agents\beta\reviewer.md");
+        // 这些路径并不存在 → canonicalize 失败 → 回退到原样字符串，仍然可区分。
+        assert_ne!(
+            backup_name(a, "S"),
+            backup_name(b, "S"),
+            "不同目录下的同名文件必须得到不同的备份键"
+        );
+        assert!(
+            backup_name(a, "S").contains("reviewer.md"),
+            "备份名要保留文件名以便人工辨认: {}",
+            backup_name(a, "S")
+        );
+        assert!(backup_name(a, "S").ends_with(".S.bak"));
+
+        // 超长路径（截断分支）仍必须唯一且不超过文件名长度上限
+        let long_a = format!(r"C:\{}.md", "d".repeat(400));
+        let long_b = format!(r"C:\{}x.md", "d".repeat(400));
+        let name = backup_name(Path::new(&long_a), "20260922T153000");
+        let file_name = name.rsplit('/').next().unwrap();
+        assert!(file_name.len() < 200, "备份文件名过长（{}）: {file_name}", file_name.len());
+        assert_ne!(
+            backup_name(Path::new(&long_a), "S"),
+            backup_name(Path::new(&long_b), "S"),
+            "截断后仍必须靠路径哈希保持唯一"
+        );
+    }
+
+    #[test]
+    fn ensure_within_agents_dir_accepts_inside_and_rejects_escapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("agents");
+        std::fs::create_dir_all(agents.join("sub")).unwrap();
+        let inside = agents.join("sub/ok.md");
+        std::fs::write(&inside, "---\nname: ok\n---\n").unwrap();
+        let outside_dir = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let outside = outside_dir.join("bad.md");
+        std::fs::write(&outside, "---\nname: bad\n---\n").unwrap();
+        // 规范化之后等价于 outside 的".."路径
+        let traversal = agents.join("sub/../../elsewhere/bad.md");
+
+        assert!(ensure_within_agents_dir(&agents, &inside).is_ok(), "目录内的文件必须放行");
+        assert!(ensure_within_agents_dir(&agents, &agents).is_ok(), "目录自身也算在内");
+        assert!(
+            ensure_within_agents_dir(&agents, &outside).is_err(),
+            "目录外的绝对路径必须拒绝"
+        );
+        assert!(
+            ensure_within_agents_dir(&agents, &traversal).is_err(),
+            "`..` 回退逃逸必须拒绝"
+        );
+        let err = ensure_within_agents_dir(&agents, &outside).unwrap_err();
+        assert!(matches!(err, Error::ConfigInvalid(_)), "必须是清晰的拒绝错误: {err:?}");
+
+        // 无法 canonicalize（不存在）→ 拒绝，而不是放行
+        assert!(
+            ensure_within_agents_dir(&agents, &agents.join("nope.md")).is_err(),
+            "不存在的候选路径无法确立边界，必须 fail-closed"
+        );
+        // 目录不存在 → 拒绝（边界无法确立）
+        assert!(ensure_within_agents_dir(&dir.path().join("no-such-dir"), &inside).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ensure_within_agents_dir_rejects_symlink_escape() {        use std::os::windows::fs::symlink_file;
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let outside = dir.path().join("secret.md");
+        std::fs::write(&outside, "---\nname: secret\n---\n").unwrap();
+        let link = agents.join("link.md");
+        if symlink_file(&outside, &link).is_err() {
+            // 未开启开发者模式/无权限时无法创建符号链接；此时该子断言无法执行。
+            // 这不是"静默通过"：其余三类逃逸已在另一个测试里被真实覆盖。
+            eprintln!("skip: 本机不允许创建符号链接（需要开发者模式）");
+            return;
+        }
+        assert!(
+            ensure_within_agents_dir(&agents, &link).is_err(),
+            "指向目录外的符号链接必须被拒（canonicalize 后落在 agents 之外）"
+        );
+    }
 }

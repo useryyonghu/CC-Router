@@ -5,8 +5,8 @@
 //! 需要路径的地方一律显式传入，绝不调用 `claude_settings_path()` / `agents_dir()`。
 
 use cc_router::claude::agents::{
-    create_agent, delete_agent, list_agents, restore_agent, set_model, set_model_recorded,
-    ModelChoice,
+    create_agent, delete_agent, delete_agent_at, list_agents, restore_agent, set_model,
+    set_model_recorded, set_model_recorded_at, ModelChoice,
 };
 use cc_router::claude::settings::{
     apply_takeover, apply_takeover_at, build_env_updates, restore, takeover_state, RestorePath,
@@ -27,10 +27,16 @@ use std::path::Path;
 /// 与真实文件的两处刻意差异：额外加入 spec §7.1 要求**移除**的三个旧键
 /// （`ANTHROPIC_MODEL` / `ANTHROPIC_API_KEY` / `ANTHROPIC_SMALL_FAST_MODEL`），
 /// 否则"移除"规则无从被夹具覆盖。
+///
+/// **本夹具刻意是"非规范" JSON**，否则 AC8 主用例毫无判别力：
+/// 1. 顶层 `aaa_non_canonical` 排在 `env` 之后，而 `serde_json` 按 BTreeMap 排序会把它排到最前；
+/// 2. `attribution` 内层用 6 空格缩进，而 `to_string_pretty` 会写成 4 空格。
+/// 因此任何"重新序列化"的还原路径都必然产出不同字节 —— 只有真正回放接管前原始字节的
+/// `Verbatim` 路径才能通过该用例。
 const REAL_SHAPE: &str = r#"{
   "attribution": {
-    "commit": "",
-    "pr": ""
+      "commit": "",
+      "pr": ""
   },
   "env": {
     "ANTHROPIC_API_KEY": "sk-mimo-should-be-removed",
@@ -49,6 +55,9 @@ const REAL_SHAPE: &str = r#"{
     "API_TIMEOUT_MS": "600000",
     "CLAUDE_CODE_EFFORT_LEVEL": "high",
     "CLAUDE_CODE_SUBAGENT_MODEL": "mimo-v2.6-flash[1M]"
+  },
+  "aaa_non_canonical": {
+    "why": "本键字母序应在最前，这里刻意放在最后"
   }
 }
 "#;
@@ -126,6 +135,40 @@ fn pre_baks(backups: &Path) -> Vec<String> {
         .unwrap_or_default();
     names.sort();
     names
+}
+
+/// 递归收集 `dir` 下所有以 `suffix` 结尾的文件名。
+fn file_names(dir: &Path, suffix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else { return out };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(file_names(&path, suffix));
+        } else {
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            if name.ends_with(suffix) {
+                out.push(name);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// 递归读回 `dir` 下所有 `.bak` 的字节内容。
+fn bak_bytes(dir: &Path) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else { return out };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(bak_bytes(&path));
+        } else if path.to_string_lossy().ends_with(".bak") {
+            out.push(fs::read(&path).unwrap());
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------- Task 2
@@ -391,6 +434,11 @@ fn backup_files_are_written_once_per_takeover() {
 }
 
 /// pre 快照丢失（用户手工清理了 backups）时，清单回放仍然可用。
+///
+/// 注意这条路径**不是**逐字节还原：合并式回放要重新序列化 JSON，而夹具是刻意非规范的
+/// （键序不排序 + `attribution` 内层 6 空格）。这正是 AC8 必须依赖 `Verbatim` 路径
+/// （回放接管前的原始字节）的原因 —— 本测试同时断言"语义相等且字节不等"，
+/// 从而**证明夹具确实具备判别力**：若夹具是规范的，下面的 `assert_ne!` 会失败。
 #[test]
 fn restore_falls_back_to_manifest_when_backups_are_gone() {
     let dir = tempfile::tempdir().unwrap();
@@ -398,19 +446,26 @@ fn restore_falls_back_to_manifest_when_backups_are_gone() {
     let backups = dir.path().join("backups");
     fs::write(&path, REAL_SHAPE).unwrap();
     let before = fs::read(&path).unwrap();
+    let before_json: Value = serde_json::from_slice(&before).unwrap();
     let cfg = demo_cfg();
     let manifest = apply_takeover(&cfg, &path, &backups).unwrap();
 
     fs::remove_dir_all(&backups).unwrap();
     let out = restore(&manifest, &path, &backups).unwrap();
     assert_eq!(out.path, RestorePath::MergedManifest);
+
+    let after_bytes = fs::read(&path).unwrap();
+    let after_json: Value = serde_json::from_slice(&after_bytes).unwrap();
+    assert_eq!(after_json, before_json, "合并式回放必须做到键值完全等价");
+    assert_ne!(
+        after_bytes, before,
+        "该夹具下合并式回放不可能逐字节相等（否则夹具是规范的，AC8 主用例就失去判别力）"
+    );
+
     let env = env_of(&path);
     assert_eq!(env["ANTHROPIC_BASE_URL"], "https://api.xiaomimimo.com/anthropic");
     assert_eq!(env["CLAUDE_CODE_SUBAGENT_MODEL"], "mimo-v2.6-flash[1M]");
     assert_eq!(env["ANTHROPIC_MODEL"], "mimo-v2.6-pro");
-    // 夹具本身就是 2 空格缩进 + 键序排序 + 末尾单换行，与本应用的写出格式一致，
-    // 因此这条路径在这个夹具上也逐字节相等（但 AC8 的保证来自 Verbatim 路径）。
-    assert_eq!(fs::read(&path).unwrap(), before);
 }
 
 // ---------------------------------------------------------------- Task 3
@@ -585,7 +640,9 @@ fn create_then_delete_round_trips() {
         .map(|e| e.file_name().to_string_lossy().to_string())
         .collect();
     assert!(
-        baks.iter().any(|n| n.starts_with("code-reviewer.md.") && n.ends_with(".bak")),
+        // 备份名以**规范化完整路径**为键（避免不同子目录的同名文件互相覆盖），
+        // 因此文件名出现在中段而不是开头。
+        baks.iter().any(|n| n.contains("code-reviewer.md.") && n.ends_with(".bak")),
         "删除前必须先备份: {baks:?}"
     );
 }
@@ -727,5 +784,164 @@ fn legacy_config_without_manifest_field_still_deserializes() {
     assert!(!cfg.takeover.enabled);
     assert_eq!(cfg.gateway.port, 8787);
 }
+
+// ---------------------------------------------------------------- 修复轮 1
+
+/// CRITICAL：子 Agent 目录是**递归**的，两个不同子目录下的同名文件在同一次操作里
+/// 绝不能共用备份 —— 否则后者的备份被静默跳过（write-if-absent），而清单仍记着
+/// 前者的备份路径，`restore_agent` 会把前者的字节写进后者，且后者的原文永久丢失。
+/// `delete_agent` 走同一条备份路径，同样不得碰撞。
+#[test]
+fn same_named_agents_in_different_subdirs_do_not_share_backups() {
+    let dir = tempfile::tempdir().unwrap();
+    let agents = dir.path().join("agents");
+    let backups = dir.path().join("backups");
+    let stamp = "20260922T153000";
+
+    let alpha = agents.join("alpha/reviewer.md");
+    let beta = agents.join("beta/reviewer.md");
+    fs::create_dir_all(alpha.parent().unwrap()).unwrap();
+    fs::create_dir_all(beta.parent().unwrap()).unwrap();
+    let orig_alpha = "---\nname: Alpha Reviewer\n---\nAlpha 的正文\n";
+    let orig_beta = "---\nname: Beta Reviewer\n---\nBeta 的正文，与 Alpha 完全不同\n";
+    fs::write(&alpha, orig_alpha).unwrap();
+    fs::write(&beta, orig_beta).unwrap();
+
+    let ea = set_model_recorded_at(&alpha, ModelChoice::Alias("ccr-kimi-k3"), &backups, stamp).unwrap();
+    let eb = set_model_recorded_at(&beta, ModelChoice::Alias("ccr-ds-flash"), &backups, stamp).unwrap();
+
+    assert_ne!(
+        ea.backup_file, eb.backup_file,
+        "两个同名文件绝不能共用同一个备份路径（否则后者的备份被静默跳过）"
+    );
+    let ba = backups.join(ea.backup_file.as_ref().unwrap());
+    let bb = backups.join(eb.backup_file.as_ref().unwrap());
+    assert!(ba.exists() && bb.exists(), "两份备份都必须存在: {ba:?} / {bb:?}");
+    assert_eq!(fs::read(&ba).unwrap(), orig_alpha.as_bytes(), "alpha 的备份必须是 alpha 的原文");
+    assert_eq!(fs::read(&bb).unwrap(), orig_beta.as_bytes(), "beta 的备份必须是 beta 的原文");
+
+    restore_agent(&ea, &backups).unwrap();
+    restore_agent(&eb, &backups).unwrap();
+    assert_eq!(fs::read(&alpha).unwrap(), orig_alpha.as_bytes(), "alpha 必须还原成 alpha 的原文");
+    assert_eq!(
+        fs::read(&beta).unwrap(),
+        orig_beta.as_bytes(),
+        "beta 必须还原成 beta 的原文 —— 不得被 alpha 的字节覆盖"
+    );
+
+    // delete_agent 的备份命名走同一条路径
+    let gamma = agents.join("gamma/reviewer.md");
+    let delta = agents.join("delta/reviewer.md");
+    fs::create_dir_all(gamma.parent().unwrap()).unwrap();
+    fs::create_dir_all(delta.parent().unwrap()).unwrap();
+    let orig_gamma = "gamma 的原文\n";
+    let orig_delta = "delta 的原文\n";
+    fs::write(&gamma, orig_gamma).unwrap();
+    fs::write(&delta, orig_delta).unwrap();
+    delete_agent_at(&gamma, &backups, stamp).unwrap();
+    delete_agent_at(&delta, &backups, stamp).unwrap();
+    let baks = bak_bytes(&backups);
+    assert!(
+        baks.iter().any(|b| b == orig_gamma.as_bytes()),
+        "gamma 删除前的原文必须有备份"
+    );
+    assert!(
+        baks.iter().any(|b| b == orig_delta.as_bytes()),
+        "delta 删除前的原文必须有备份 —— 不得被 gamma 覆盖"
+    );
+}
+
+/// IMPORTANT 1：post 快照必须**先于** `settings.json` 落盘。
+/// 否则 settings.json 写成功、post.bak 写失败时，会留下"文件已被接管、却没有任何还原依据"
+/// 的状态（清单是在 `apply_takeover` 返回 Ok 之后才由上层落盘的）：
+/// `takeover_status` 说 applied，`takeover_restore` 说"没有记录"。
+#[test]
+fn post_snapshot_is_written_before_settings_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let backups = dir.path().join("backups");
+    // 让"写 settings.json"必然失败：其父目录位置被一个普通文件占住，
+    // `atomic_write_bytes` 的 create_dir_all 会报错；备份目录则完全可用。
+    let blocker = dir.path().join("blocker");
+    fs::write(&blocker, "I am a file, not a directory").unwrap();
+    let settings = blocker.join("settings.json");
+    let cfg = demo_cfg();
+
+    let err = apply_takeover(&cfg, &settings, &backups).unwrap_err();
+    assert!(
+        matches!(err, cc_router::error::Error::Io { .. }),
+        "写 settings.json 失败必须冒泡成 IO 错误: {err:?}"
+    );
+
+    let posts = file_names(&backups, ".post.bak");
+    assert_eq!(
+        posts.len(),
+        1,
+        "post 快照必须先于 settings.json 写入（settings 写失败时它也应已存在）；实际: {posts:?}"
+    );
+    assert!(!settings.exists(), "settings.json 不得被创建");
+    assert_ne!(
+        takeover_state(&cfg, &settings),
+        FileState::Applied,
+        "文件没写成，状态就绝不能是 applied"
+    );
+}
+
+/// MINOR(5a)：合并式回放遇到"env 存在但不是 JSON 对象"必须明确报错，
+/// 不能静默跳过 —— 静默跳过会让调用方以为键都还原了（`changed_keys` 还显示"无事发生"）。
+#[test]
+fn merged_replay_rejects_non_object_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let backups = dir.path().join("backups");
+    fs::write(&path, REAL_SHAPE).unwrap();
+    let cfg = demo_cfg();
+    let manifest = apply_takeover(&cfg, &path, &backups).unwrap();
+
+    let mut doc: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    doc["env"] = json!("oops, 手工编辑把 env 写坏了");
+    fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&doc).unwrap())).unwrap();
+    let edited = fs::read(&path).unwrap();
+
+    let err = restore(&manifest, &path, &backups).unwrap_err();
+    assert!(
+        matches!(err, cc_router::error::Error::ConfigInvalid(_)),
+        "必须明确报错而不是静默跳过: {err:?}"
+    );
+    assert!(err.to_string().contains("env"), "错误消息必须点名 env: {err}");
+    assert_eq!(fs::read(&path).unwrap(), edited, "报错时不得改动文件");
+}
+
+/// MINOR(5b)：接管前文件不存在 + 接管后被外部改动 → 还原不得悄悄删掉别人的内容。
+/// （旧实现会直接删除该文件，却把路径标成 `MergedManifest`，等于把"销毁"谎报成"合并"。）
+#[test]
+fn restore_refuses_to_delete_externally_edited_absent_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let backups = dir.path().join("backups");
+    let cfg = demo_cfg();
+    let manifest = apply_takeover(&cfg, &path, &backups).unwrap();
+    assert!(path.exists(), "接管前不存在 → 接管后由我们创建");
+
+    let mut doc: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    doc["someones_edit"] = json!(true);
+    fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&doc).unwrap())).unwrap();
+    let edited = fs::read(&path).unwrap();
+    assert_ne!(edited, fs::read(backups.join(&manifest.post_bytes_file)).unwrap());
+
+    let err = restore(&manifest, &path, &backups).unwrap_err();
+    assert!(
+        matches!(err, cc_router::error::Error::ConfigInvalid(_)),
+        "必须拒绝并说明，不能悄悄删除: {err:?}"
+    );
+    assert!(err.to_string().contains("外部改动"), "必须说清拒绝原因: {err}");
+    assert_eq!(fs::read(&path).unwrap(), edited, "拒绝时不得删除或改动该文件");
+
+    // 外部内容被清掉（回到我们写出的字节）后，还原照常删除文件（spec §7.3）
+    fs::write(&path, fs::read(backups.join(&manifest.post_bytes_file)).unwrap()).unwrap();
+    let out = restore(&manifest, &path, &backups).unwrap();
+    assert_eq!(out.path, RestorePath::Verbatim);
+    assert!(!path.exists());
+}
+
 
 
