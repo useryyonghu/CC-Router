@@ -92,40 +92,59 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     Ok(())
 }
 
+/// 托盘动作失败时的**唯一**上报路径：写 stderr **并且**把主窗口拉到前台。
+///
+/// 为什么必须把窗口拉到前台，而不是只写一行 stderr：Tauri 2 核心没有对话框 API
+/// （也不允许为它新增依赖），而 release 构建是 windows 子系统、根本没有控制台 ——
+/// 只写 stderr 的失败在用户眼里与成功**无法区分**。他点了「接管 Claude Code」，
+/// 什么都没发生，于是合理地认为它成功了，而 Claude Code 其实根本没被接管 ——
+/// 这是会让人按错误前提行事的"沉默的成功"，比报错更糟。
+/// 拉前台后用户能当场看到真实状态（状态页 / 日志页就在那里）。
+/// 只在**失败**时调用：成功时弹窗只会打扰"随手开个网关"这类日常操作。
+fn report_tray_failure<R: Runtime>(app: &AppHandle<R>, action: &str, e: &str) {
+    eprintln!("[cc-router] 托盘「{action}」失败：{e}");
+    show_main_window(app);
+}
+
 /// 菜单事件分发。每一项都转调 `commands.rs` 的实现。
 fn on_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
     match id {
         "tray-show-window" => show_main_window(app),
         "tray-gateway-start" => {
             // `gateway_start` 是 async：菜单回调是同步的，必须丢回 async 运行时。
+            // `AppHandle` 是 `Clone`：失败上报要用它，所以克隆一份进闭包。
             let state = app_state(app);
+            let handle = app.clone();
             tauri::async_runtime::spawn(async move {
                 match commands::gateway_start_impl(&state).await {
                     Ok(port) => eprintln!("[cc-router] 托盘：网关已启动，端口 {port}"),
-                    Err(e) => eprintln!("[cc-router] 托盘「启动网关」失败：{e}"),
+                    Err(e) => report_tray_failure(&handle, "启动网关", &e),
                 }
             });
         }
         "tray-gateway-stop" => {
             let state = app_state(app);
+            let handle = app.clone();
             tauri::async_runtime::spawn(async move {
                 match commands::gateway_stop_impl(&state).await {
                     Ok(()) => eprintln!("[cc-router] 托盘：网关已停止"),
-                    Err(e) => eprintln!("[cc-router] 托盘「停止网关」失败：{e}"),
+                    Err(e) => report_tray_failure(&handle, "停止网关", &e),
                 }
             });
         }
         "tray-takeover-apply" => {
             let state = app_state(app);
+            let handle = app.clone();
             tauri::async_runtime::spawn(async move {
                 match commands::takeover_apply_impl(&state) {
                     Ok(status) => eprintln!("[cc-router] 托盘：接管状态 = {}", status.state),
-                    Err(e) => eprintln!("[cc-router] 托盘「接管 Claude Code」失败：{e}"),
+                    Err(e) => report_tray_failure(&handle, "接管 Claude Code", &e),
                 }
             });
         }
         "tray-takeover-restore" => {
             let state = app_state(app);
+            let handle = app.clone();
             tauri::async_runtime::spawn(async move {
                 match commands::takeover_restore_state(&state) {
                     Ok(dto) => eprintln!(
@@ -133,7 +152,7 @@ fn on_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
                         dto.path,
                         dto.changed_keys.len()
                     ),
-                    Err(e) => eprintln!("[cc-router] 托盘「还原」失败：{e}"),
+                    Err(e) => report_tray_failure(&handle, "还原", &e),
                 }
             });
         }
