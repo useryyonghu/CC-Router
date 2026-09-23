@@ -51,19 +51,23 @@ const roleSlots = computed(() =>
 );
 
 // ---------------------------------------------------------------- 网关
+//
+// 下面每个 `run(...)` 的第三个参数都要与按钮上 `isBusy('<key>')` 的 key 一致（I4）：
+// 少了它 `busyKey` 会停在 `""`，按钮既不会转圈也不会禁用（连点会被后端互斥挡住，
+// 但 UI 契约失效，且与 RolesView 的写法不一致）。
 
 function startGateway() {
   return run(async () => {
     await ipc.gatewayStart();
     await store.refreshGateway();
-  }, "网关已启动");
+  }, "网关已启动", "gateway-start");
 }
 
 function stopGateway() {
   return run(async () => {
     await ipc.gatewayStop();
     await store.refreshGateway();
-  }, "网关已停止");
+  }, "网关已停止", "gateway-stop");
 }
 
 function restartGateway() {
@@ -71,7 +75,7 @@ function restartGateway() {
     await ipc.gatewayRestart();
     await store.refreshGateway();
     await store.refreshConfig();
-  }, "网关已重启");
+  }, "网关已重启", "gateway-restart");
 }
 
 // ---------------------------------------------------------------- 接管
@@ -104,7 +108,7 @@ async function applyTakeover() {
     await ipc.takeoverApply();
     await store.refreshTakeover();
     await store.refreshConfig();
-  }, "已接管 Claude Code（settings.json 已指向本机网关）");
+  }, "已接管 Claude Code（settings.json 已指向本机网关）", "takeover-apply");
 }
 
 async function restoreTakeover() {
@@ -117,7 +121,7 @@ async function restoreTakeover() {
     await ipc.takeoverRestore();
     await store.refreshTakeover();
     await store.refreshConfig();
-  }, "已还原 Claude Code 配置");
+  }, "已还原 Claude Code 配置", "takeover-restore");
 }
 
 // ---------------------------------------------------------------- 日志
