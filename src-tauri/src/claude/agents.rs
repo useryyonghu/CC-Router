@@ -679,6 +679,10 @@ mod tests {
         let pairs = [
             (r"C:\x\agents\a\b.md", r"C:\x\agents\a_b.md"),
             (r"C:\x\agents\reviewer pro.md", r"C:\x\agents\reviewer_pro.md"),
+            // 非 ASCII 字符同样被逐个扁平化成 '_'，所以**同长度的中文名**曾互相碰撞
+            // （两个字符的 `评审` 与 `测试` 都变成 `__`），`评审\a.md` 与 `评审_a.md` 也是。
+            (r"C:\x\agents\评审.md", r"C:\x\agents\测试.md"),
+            (r"C:\x\agents\评审\a.md", r"C:\x\agents\评审_a.md"),
         ];
         for (left, right) in pairs {
             let ln = backup_name(Path::new(left), "S");
